@@ -115,6 +115,9 @@ class SAC_Network(torch.nn.Module):
         utilities.init_orthogonal(self.up_logits)
         utilities.init_orthogonal(self.down_logits)
 
+        print("Initial steer_mean weights:", self.steer_mean.weight.data)
+        print("Initial steer_log_std weights:", self.steer_log_std.weight.data)
+
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[
         tuple[tuple[Tensor, Tensor], Tensor, Tensor], Tensor]:
         """
@@ -134,6 +137,7 @@ class SAC_Network(torch.nn.Module):
 
         return ((steer_mean, steer_log_std), self.up_logits(shared), self.down_logits(shared)), features
 
+    @torch.jit.export
     def get_q_values(self, features: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get Q-values for state-action pairs"""
         sa_pairs = torch.cat([features, actions], dim=1)
@@ -201,6 +205,7 @@ class Trainer:
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
         """
         Implements one iteration of SAC training
+        https://spinningup.openai.com/en/latest/algorithms/sac.html?highlight=gammas#pseudocode
         """
         self.policy_optimizer.zero_grad(set_to_none=True)
         self.q_optimizer.zero_grad(set_to_none=True)
@@ -223,11 +228,11 @@ class Trainer:
 
             # Compute policy distribution and Q-values for current state
             policy_dist, features = self.online_network(state_img_tensor, state_float_tensor)
-            
+
             # Sample actions and compute log probs
             sampled_actions = policy_dist.rsample()
             log_prob = policy_dist.log_prob(sampled_actions).sum(dim=-1, keepdim=True)
-            
+
             # Get Q-values
             q1_pred, q2_pred = self.online_network.get_q_values(features, sampled_actions)
 
@@ -236,38 +241,43 @@ class Trainer:
                 next_policy_dist, next_features = self.target_network(next_state_img_tensor, next_state_float_tensor)
                 next_actions = next_policy_dist.rsample()
                 next_log_prob = next_policy_dist.log_prob(next_actions).sum(dim=-1, keepdim=True)
-                
+
                 next_q1, next_q2 = self.target_network.get_q_values(next_features, next_actions)
                 next_q = torch.min(next_q1, next_q2) - alpha * next_log_prob
                 q_target = rewards + gammas_terminal * next_q
 
             # Compute losses
             critic_loss, actor_loss, temp_loss = sac_loss(q1_pred, q2_pred, q_target, log_prob, alpha)
+            total_loss = critic_loss + actor_loss + temp_loss
 
             if do_learn:
-                # Update critics
-                self.scaler.scale(critic_loss).backward(retain_graph=True)
+                # Single backward pass
+                self.scaler.scale(total_loss).backward()
+
+                # Unscale all optimizers
                 self.scaler.unscale_(self.q_optimizer)
-                torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), config_copy.clip_grad_norm)
-                self.scaler.step(self.q_optimizer)
-
-                # Update actor
-                self.scaler.scale(actor_loss).backward(retain_graph=True)
                 self.scaler.unscale_(self.policy_optimizer)
-                torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), config_copy.clip_grad_norm)
-                self.scaler.step(self.policy_optimizer)
-
-                # Update temperature
-                self.scaler.scale(temp_loss).backward()
                 self.scaler.unscale_(self.alpha_optimizer)
+
+                # Gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.online_network.parameters(),
+                    config_copy.clip_grad_norm
+                ).detach().cpu().item()
+
+                # Step all optimizers
+                self.scaler.step(self.q_optimizer)
+                self.scaler.step(self.policy_optimizer)
                 self.scaler.step(self.alpha_optimizer)
 
+                # Single scaler update
                 self.scaler.update()
+            else:
+                grad_norm = 0
 
-            total_loss = critic_loss + actor_loss + temp_loss
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), config_copy.clip_grad_norm).detach().cpu().item()
+            total_loss = total_loss.detach().cpu()
 
-        return total_loss.detach().cpu(), grad_norm
+        return total_loss, grad_norm
 
 class Inferer:
     __slots__ = (
@@ -300,18 +310,24 @@ class Inferer:
         Tuple[float, bool, bool], bool, float, npt.NDArray]:
         """Returns (steer, up, down) action tuple"""
         (steer_dist, up_dist, down_dist), features = self.infer_network(img_inputs_uint8, float_inputs)
-        steer_dist = torch.distributions.Normal(*steer_dist)
+        mean, log_std = steer_dist
+        print(f"Steering mean: {mean.item():.3f}, std: {log_std.exp().item():.3f}")
+        steer_dist = torch.distributions.Normal(mean, log_std.exp())
         up_dist = torch.distributions.Bernoulli(logits=up_dist)
         down_dist = torch.distributions.Bernoulli(logits=down_dist)
 
         r = random.random()
+
         if self.is_explo and r < self.epsilon:
             # Sample during exploration
-            steer = steer_dist.sample().item()
+            is_greedy = False
+            steer = torch.clamp(steer_dist.sample(), -1.0, 1.0).item()
+            print(f"Exploration: eps={self.epsilon}, sampled_steer={steer}")
             up = up_dist.sample().bool().item()
             down = down_dist.sample().bool().item()
         else:
             # Use means during exploitation
+            is_greedy = True
             steer = steer_dist.mean.item()
             up = (up_dist.probs > 0.5).bool().item()
             down = (down_dist.probs > 0.5).bool().item()
@@ -323,7 +339,7 @@ class Inferer:
 
         return (
             (steer, up, down),  # Action tuple
-            not self.is_explo,  # is_greedy
+            is_greedy,  # is_greedy
             value,  # Q-value
             action_tensor.cpu().numpy()  # Full action tensor
         )

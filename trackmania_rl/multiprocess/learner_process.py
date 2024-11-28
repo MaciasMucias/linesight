@@ -600,7 +600,6 @@ def learner_process_fn(
                 "n_steps": config_copy.n_steps,
                 "epsilon": utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value),
                 "epsilon_boltzmann": utilities.from_exponential_schedule(config_copy.epsilon_boltzmann_schedule, shared_steps.value),
-                "tau_epsilon_boltzmann": config_copy.tau_epsilon_boltzmann,
                 "learning_rate": learning_rate,
                 "weight_decay": weight_decay,
                 "discard_non_greedy_actions_in_nsteps": config_copy.discard_non_greedy_actions_in_nsteps,
@@ -664,7 +663,7 @@ def learner_process_fn(
             # ===============================================
             #   COLLECT IQN SPREAD
             # ===============================================
-
+            # TODO: WTF IS THIS
             if online_network.training:
                 online_network.eval()
             tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
