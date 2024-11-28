@@ -187,6 +187,7 @@ class Trainer:
         alpha_optimizer: torch.optim.Optimizer,
         scaler: torch.amp.GradScaler,
         batch_size: int,
+        log_alpha: torch.Tensor
     ):
         self.online_network = online_network
         self.target_network = target_network
@@ -195,7 +196,7 @@ class Trainer:
         self.alpha_optimizer = alpha_optimizer
         self.scaler = scaler
         self.batch_size = batch_size
-        self.log_alpha = torch.zeros(1, requires_grad=True, device="cuda")
+        self.log_alpha = log_alpha
 
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
         """

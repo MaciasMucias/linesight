@@ -160,12 +160,39 @@ def learner_process_fn(
     neural_net_reset_counter = 0
     single_reset_flag = config_copy.single_reset_flag
 
-    optimizer1 = torch.optim.RAdam(
-        online_network.parameters(),
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"]),
+    log_alpha = torch.zeros(1, requires_grad=True, device="cuda")
+
+    # Policy optimizer - for actor networks
+    policy_optimizer = torch.optim.RAdam(
+        # Filter parameters that belong to policy parts
+        [p for name, p in online_network.named_parameters()
+         if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+                                               accumulated_stats["cumul_number_memories_generated"]),
         eps=config_copy.adam_epsilon,
         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
     )
+
+    # Q-network optimizer - for critic networks
+    q_optimizer = torch.optim.RAdam(
+        # Filter parameters that belong to Q networks
+        [p for name, p in online_network.named_parameters()
+         if any(x in name for x in ['q1_net', 'q2_net'])],
+        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+                                               accumulated_stats["cumul_number_memories_generated"]),
+        eps=config_copy.adam_epsilon,
+        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    )
+
+    # Alpha optimizer - for temperature parameter
+    alpha_optimizer = torch.optim.RAdam(
+        [log_alpha],  # Only optimize the temperature parameter
+        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+                                               accumulated_stats["cumul_number_memories_generated"]),
+        eps=config_copy.adam_epsilon,
+        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    )
+
     # optimizer1 = torch_optimizer.Lookahead(optimizer1, k=5, alpha=0.5)
 
     scaler = torch.amp.GradScaler("cuda")
@@ -177,9 +204,11 @@ def learner_process_fn(
 
     # noinspection PyBroadException
     try:
-        optimizer1.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
+        policy_optimizer.load_state_dict(torch.load(f=save_dir / "policy_optimizer.torch", weights_only=False))
+        q_optimizer.load_state_dict(torch.load(f=save_dir / "q_optimizer.torch", weights_only=False))
+        alpha_optimizer.load_state_dict(torch.load(f=save_dir / "alpha_optimizer.torch", weights_only=False))
         scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
-        print(" =========================     Optimizer loaded !     ================================")
+        print(" =========================     Optimizers loaded !     ================================")
     except:
         print(" Could not load optimizer")
 
@@ -201,11 +230,12 @@ def learner_process_fn(
     trainer = sac.Trainer(
         online_network=online_network,
         target_network=target_network,
-        policy_optimizer=,
-        q_optimizer=,
-        alpha_optimizer=,
+        policy_optimizer=policy_optimizer,
+        q_optimizer=q_optimizer,
+        alpha_optimizer=alpha_optimizer,
         scaler=scaler,
         batch_size=config_copy.batch_size,
+        log_alpha=log_alpha,
     )
 
     inferer = sac.Inferer(
@@ -285,10 +315,11 @@ def learner_process_fn(
         #   RELOAD
         # ===============================================
 
-        for param_group in optimizer1.param_groups:
-            param_group["lr"] = learning_rate
-            param_group["epsilon"] = config_copy.adam_epsilon
-            param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+        for optimizer in [policy_optimizer, q_optimizer, alpha_optimizer]:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = learning_rate
+                param_group["epsilon"] = config_copy.adam_epsilon
+                param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
 
         if isinstance(buffer._sampler, PrioritizedSampler):
             buffer._sampler._alpha = config_copy.prio_alpha
@@ -406,7 +437,9 @@ def learner_process_fn(
                     save_dir / "best_runs",
                     online_network,
                     target_network,
-                    optimizer1,
+                    policy_optimizer,
+                    q_optimizer,
+                    alpha_optimizer,
                     scaler,
                 )
 
@@ -643,43 +676,48 @@ def learner_process_fn(
             #   WRITE TO TENSORBOARD
             # ===============================================
 
-            walltime_tb = time.time()
-            for name, param in online_network.named_parameters():
-                tensorboard_writer.add_scalar(
-                    tag=f"layer_{name}_L2",
-                    scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
-                    global_step=accumulated_stats["cumul_number_frames_played"],
-                    walltime=walltime_tb,
-                )
-            assert len(optimizer1.param_groups) == 1
-            try:
-                for p, (name, _) in zip(
-                    optimizer1.param_groups[0]["params"],
-                    online_network.named_parameters(),
-                ):
-                    state = optimizer1.state[p]
-                    exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                    mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
-                    tensorboard_writer.add_scalar(
-                        tag=f"lr_ratio_{name}_L2",
-                        scalar_value=np.sqrt((mod_lr**2).mean().detach().cpu().item()),
-                        global_step=accumulated_stats["cumul_number_frames_played"],
-                        walltime=walltime_tb,
-                    )
-                    tensorboard_writer.add_scalar(
-                        tag=f"exp_avg_{name}_L2",
-                        scalar_value=np.sqrt((exp_avg**2).mean().detach().cpu().item()),
-                        global_step=accumulated_stats["cumul_number_frames_played"],
-                        walltime=walltime_tb,
-                    )
-                    tensorboard_writer.add_scalar(
-                        tag=f"exp_avg_sq_{name}_L2",
-                        scalar_value=np.sqrt((exp_avg_sq**2).mean().detach().cpu().item()),
-                        global_step=accumulated_stats["cumul_number_frames_played"],
-                        walltime=walltime_tb,
-                    )
-            except:
-                pass
+            # TODO: Add tensorboard back
+            # walltime_tb = time.time()
+            # for name, param in online_network.named_parameters():
+            #     tensorboard_writer.add_scalar(
+            #         tag=f"layer_{name}_L2",
+            #         scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
+            #         global_step=accumulated_stats["cumul_number_frames_played"],
+            #         walltime=walltime_tb,
+            #     )
+            # assert len(policy_optimizer.param_groups) == 1
+            # assert len(q_optimizer.param_groups) == 1
+            # assert len(alpha_optimizer.param_groups) == 1
+            # try:
+            #     for policy_p, q_p, alpha_p, (name, _) in zip(
+            #         policy_optimizer.param_groups[0]["params"],
+            #         q_optimizer.param_groups[0]["params"],
+            #         alpha_optimizer.param_groups[0]["params"],
+            #         online_network.named_parameters(),
+            #     ):
+            #         state = optimizer1.state[p]
+            #         exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            #         mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
+            #         tensorboard_writer.add_scalar(
+            #             tag=f"lr_ratio_{name}_L2",
+            #             scalar_value=np.sqrt((mod_lr**2).mean().detach().cpu().item()),
+            #             global_step=accumulated_stats["cumul_number_frames_played"],
+            #             walltime=walltime_tb,
+            #         )
+            #         tensorboard_writer.add_scalar(
+            #             tag=f"exp_avg_{name}_L2",
+            #             scalar_value=np.sqrt((exp_avg**2).mean().detach().cpu().item()),
+            #             global_step=accumulated_stats["cumul_number_frames_played"],
+            #             walltime=walltime_tb,
+            #         )
+            #         tensorboard_writer.add_scalar(
+            #             tag=f"exp_avg_sq_{name}_L2",
+            #             scalar_value=np.sqrt((exp_avg_sq**2).mean().detach().cpu().item()),
+            #             global_step=accumulated_stats["cumul_number_frames_played"],
+            #             walltime=walltime_tb,
+            #         )
+            # except:
+            #     pass
 
             for k, v in step_stats.items():
                 tensorboard_writer.add_scalar(
@@ -736,5 +774,5 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
-            utilities.save_checkpoint(save_dir, online_network, target_network, optimizer1, scaler)
+            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, q_optimizer, alpha_optimizer, scaler)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")
