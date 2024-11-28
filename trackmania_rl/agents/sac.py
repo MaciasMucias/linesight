@@ -115,9 +115,6 @@ class SAC_Network(torch.nn.Module):
         utilities.init_orthogonal(self.up_logits)
         utilities.init_orthogonal(self.down_logits)
 
-        print("Initial steer_mean weights:", self.steer_mean.weight.data)
-        print("Initial steer_log_std weights:", self.steer_log_std.weight.data)
-
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[
         tuple[tuple[Tensor, Tensor], Tensor, Tensor], Tensor]:
         """
@@ -311,7 +308,6 @@ class Inferer:
         """Returns (steer, up, down) action tuple"""
         (steer_dist, up_dist, down_dist), features = self.infer_network(img_inputs_uint8, float_inputs)
         mean, log_std = steer_dist
-        print(f"Steering mean: {mean.item():.3f}, std: {log_std.exp().item():.3f}")
         steer_dist = torch.distributions.Normal(mean, log_std.exp())
         up_dist = torch.distributions.Bernoulli(logits=up_dist)
         down_dist = torch.distributions.Bernoulli(logits=down_dist)
@@ -322,7 +318,6 @@ class Inferer:
             # Sample during exploration
             is_greedy = False
             steer = torch.clamp(steer_dist.sample(), -1.0, 1.0).item()
-            print(f"Exploration: eps={self.epsilon}, sampled_steer={steer}")
             up = up_dist.sample().bool().item()
             down = down_dist.sample().bool().item()
         else:
