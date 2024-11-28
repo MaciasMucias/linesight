@@ -473,7 +473,7 @@ class GameInstanceManager:
                                 [
                                     previous_action[input_str]
                                     for previous_action in previous_actions
-                                    for input_str in ["accelerate", "brake", "left", "right"]
+                                    for input_str in ["accelerate", "brake", "left", "right"] #TODO: we have steer not left right
                                 ]
                             ),  # NEW
                             sim_state_car_gear_and_wheels.ravel(),  # NEW
@@ -704,8 +704,9 @@ class GameInstanceManager:
                         pc7 = time.perf_counter_ns()
                         instrumentation__convert_frame += pc7 - pc6
 
+
                         (
-                            action_idx,
+                            action_idx, # TODO: after changing the learning algorithm update this to load in steer as well
                             action_was_greedy,
                             q_value,
                             q_values,
@@ -714,7 +715,7 @@ class GameInstanceManager:
                         pc8 = time.perf_counter_ns()
                         instrumentation__exploration_policy += pc8 - pc7
 
-                        self.request_inputs(action_idx, rollout_results)
+                        self.request_inputs(action_idx, rollout_results) # TODO: as above
                         self.request_speed(self.running_speed)
 
                         if n_th_action_we_compute == 0:

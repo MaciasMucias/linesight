@@ -201,16 +201,15 @@ def learner_process_fn(
     trainer = sac.Trainer(
         online_network=online_network,
         target_network=target_network,
-        optimizer=optimizer1,
+        policy_optimizer=,
+        q_optimizer=,
+        alpha_optimizer=,
         scaler=scaler,
         batch_size=config_copy.batch_size,
-        iqn_n=config_copy.iqn_n,
     )
 
     inferer = sac.Inferer(
-        inference_network=online_network,
-        iqn_k=config_copy.iqn_k,
-        tau_epsilon_boltzmann=config_copy.tau_epsilon_boltzmann,
+        inference_network=online_network
     )
 
     while True:  # Trainer loop

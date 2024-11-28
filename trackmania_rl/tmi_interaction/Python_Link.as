@@ -165,16 +165,16 @@ int HandleMessage()
             if(debug){
                 print("Server: Set input state message");
             }
-            const bool steer = clientSock.ReadUint32();
-            const bool up = clientSock.ReadUint8()>;
+            const int steer = clientSock.ReadUint32();
+            const bool up = clientSock.ReadUint8()>0;
             const bool brake = clientSock.ReadUint8()>0;
 
             if(debug){
-                print("Set input state to "+steer+accelerate+brake);
+                print("Set input state to "+steer+up+brake);
             }
 
             if (simManager.InRace) {
-                simManager.SetInputState(InputType::Steer, Math::Clamp(steer, -65536, 65536))
+                simManager.SetInputState(InputType::Steer, Math::Clamp(steer, -65536, 65536));
                 simManager.SetInputState(InputType::Up, up?1:0);
                 simManager.SetInputState(InputType::Down, brake?1:0);
             }

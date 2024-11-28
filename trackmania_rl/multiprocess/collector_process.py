@@ -44,7 +44,7 @@ def collector_process_fn(
     except Exception as e:
         print("Worker could not load weights, exception:", e)
 
-    inferer = sac.Inferer(inference_network, config_copy.iqn_k, config_copy.tau_epsilon_boltzmann)
+    inferer = sac.Inferer(inference_network)
 
     def update_network():
         # Update weights of the inference network
@@ -96,8 +96,6 @@ def collector_process_fn(
         map_status = "trained" if map_name in set_maps_trained else "blind"
 
         inferer.epsilon = utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value)
-        inferer.epsilon_boltzmann = utilities.from_exponential_schedule(config_copy.epsilon_boltzmann_schedule, shared_steps.value)
-        inferer.tau_epsilon_boltzmann = config_copy.tau_epsilon_boltzmann
         inferer.is_explo = is_explo
 
         # ===============================================
