@@ -263,7 +263,7 @@ class GameInstanceManager:
 
     def request_inputs(self, action: (float, bool, bool), rollout_results: Dict):
         if (
-            len(rollout_results["actions"]) == 0 or rollout_results["actions"][-1] != action
+            len(rollout_results["actions"]) == 0
         ):  # Small performance trick, don't update input_state if it doesn't need to be updated
             steer, up, down = action
             self.iface.set_input_state(steer * 65536, up, down)
@@ -711,7 +711,7 @@ class GameInstanceManager:
 
                         pc8 = time.perf_counter_ns()
                         instrumentation__exploration_policy += pc8 - pc7
-
+                        print(action)
                         self.request_inputs(action, rollout_results) # TODO: as above
                         self.request_speed(self.running_speed)
 

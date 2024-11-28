@@ -95,7 +95,7 @@ class TMInterface:
         return state
 
     def set_input_state(self, steer: int, accelerate: bool, brake: bool):
-        print(np.int32(steer))
+        print(np.int32(steer), np.uint8(accelerate), np.uint8(brake))
         self.sock.sendall(
             struct.pack("iiBB", MessageType.C_SET_INPUT_STATE, np.int32(steer), np.uint8(accelerate), np.uint8(brake))
         )
