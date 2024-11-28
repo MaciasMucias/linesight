@@ -13,7 +13,7 @@ from torch import multiprocessing as mp
 
 from config_files import config_copy
 from trackmania_rl import utilities
-from trackmania_rl.agents import iqn as iqn
+from trackmania_rl.agents import sac
 
 
 def collector_process_fn(
@@ -38,13 +38,13 @@ def collector_process_fn(
         tmi_port=tmi_port,
     )
 
-    inference_network, uncompiled_inference_network = iqn.make_untrained_iqn_network(config_copy.use_jit, is_inference=True)
+    inference_network, uncompiled_inference_network = sac.make_untrained_sac_network(config_copy.use_jit, is_inference=True)
     try:
         inference_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
     except Exception as e:
         print("Worker could not load weights, exception:", e)
 
-    inferer = iqn.Inferer(inference_network, config_copy.iqn_k, config_copy.tau_epsilon_boltzmann)
+    inferer = sac.Inferer(inference_network, config_copy.iqn_k, config_copy.tau_epsilon_boltzmann)
 
     def update_network():
         # Update weights of the inference network

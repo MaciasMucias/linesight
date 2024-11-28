@@ -153,7 +153,7 @@ class SAC_Network(torch.nn.Module):
 
 
 @torch.compile(disable=not config_copy.is_linux, dynamic=False)
-def iqn_loss(targets: torch.Tensor, outputs: torch.Tensor, tau_outputs: torch.Tensor, num_quantiles: int, batch_size: int):
+def sac_loss(targets: torch.Tensor, outputs: torch.Tensor, tau_outputs: torch.Tensor, num_quantiles: int, batch_size: int):
     """
     Implements the IQN loss as defined in the IQN paper (https://arxiv.org/pdf/1806.06923)
 
@@ -194,8 +194,8 @@ class Trainer:
 
     def __init__(
         self,
-        online_network: IQN_Network,
-        target_network: IQN_Network,
+        online_network: SAC_Network,
+        target_network: SAC_Network,
         optimizer: torch.optim.Optimizer,
         scaler: torch.amp.GradScaler,
         batch_size: int,
@@ -437,7 +437,7 @@ class Inferer:
         )
 
 
-def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Network, IQN_Network]:
+def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SAC_Network, SAC_Network]:
     """
     Constructs two identical copies of the IQN network.
 
@@ -448,12 +448,11 @@ def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Netwo
         jit: a boolean indicating whether compilation should be used
     """
 
-    uncompiled_model = IQN_Network(
+    uncompiled_model = SAC_Network(
         float_inputs_dim=config_copy.float_input_dim,
         float_hidden_dim=config_copy.float_hidden_dim,
         conv_head_output_dim=config_copy.conv_head_output_dim,
         dense_hidden_dimension=config_copy.dense_hidden_dimension,
-        iqn_embedding_dimension=config_copy.iqn_embedding_dimension,
         n_actions=len(config_copy.inputs),
         float_inputs_mean=config_copy.float_inputs_mean,
         float_inputs_std=config_copy.float_inputs_std,

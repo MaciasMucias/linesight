@@ -23,8 +23,8 @@ from torchrl.data.replay_buffers import PrioritizedSampler
 
 from config_files import config_copy
 from trackmania_rl import buffer_management, utilities
-from trackmania_rl.agents import iqn as iqn
-from trackmania_rl.agents.iqn import make_untrained_iqn_network
+from trackmania_rl.agents import sac
+from trackmania_rl.agents.sac import make_untrained_sac_network
 from trackmania_rl.analysis_metrics import (
     distribution_curves,
     highest_prio_transitions,
@@ -112,8 +112,8 @@ def learner_process_fn(
     # Create new stuff
     # ========================================================
 
-    online_network, uncompiled_online_network = make_untrained_iqn_network(config_copy.use_jit, is_inference=False)
-    target_network, _ = make_untrained_iqn_network(config_copy.use_jit, is_inference=False)
+    online_network, uncompiled_online_network = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
+    target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
 
     print(online_network)
     utilities.count_parameters(online_network)
@@ -198,7 +198,7 @@ def learner_process_fn(
     # ========================================================
     # Make the trainer
     # ========================================================
-    trainer = iqn.Trainer(
+    trainer = sac.Trainer(
         online_network=online_network,
         target_network=target_network,
         optimizer=optimizer1,
@@ -207,7 +207,7 @@ def learner_process_fn(
         iqn_n=config_copy.iqn_n,
     )
 
-    inferer = iqn.Inferer(
+    inferer = sac.Inferer(
         inference_network=online_network,
         iqn_k=config_copy.iqn_k,
         tau_epsilon_boltzmann=config_copy.tau_epsilon_boltzmann,
@@ -459,29 +459,29 @@ def learner_process_fn(
                 neural_net_reset_counter = 0
                 single_reset_flag = config_copy.single_reset_flag
                 accumulated_stats["cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
-
-                _, untrained_iqn_network = make_untrained_iqn_network(config_copy.use_jit, False)
-                utilities.soft_copy_param(online_network, untrained_iqn_network, config_copy.overall_reset_mul_factor)
+                # TODO: Update the periodic reset code for the SAC
+                _, untrained_sac_network = make_untrained_sac_network(config_copy.use_jit, False)
+                utilities.soft_copy_param(online_network, untrained_sac_network, config_copy.overall_reset_mul_factor)
 
                 with torch.no_grad():
                     online_network.A_head[2].weight = utilities.linear_combination(
                         online_network.A_head[2].weight,
-                        untrained_iqn_network.A_head[2].weight,
+                        untrained_sac_network.A_head[2].weight,
                         config_copy.last_layer_reset_factor,
                     )
                     online_network.A_head[2].bias = utilities.linear_combination(
                         online_network.A_head[2].bias,
-                        untrained_iqn_network.A_head[2].bias,
+                        untrained_sac_network.A_head[2].bias,
                         config_copy.last_layer_reset_factor,
                     )
                     online_network.V_head[2].weight = utilities.linear_combination(
                         online_network.V_head[2].weight,
-                        untrained_iqn_network.V_head[2].weight,
+                        untrained_sac_network.V_head[2].weight,
                         config_copy.last_layer_reset_factor,
                     )
                     online_network.V_head[2].bias = utilities.linear_combination(
                         online_network.V_head[2].bias,
-                        untrained_iqn_network.V_head[2].bias,
+                        untrained_sac_network.V_head[2].bias,
                         config_copy.last_layer_reset_factor,
                     )
 

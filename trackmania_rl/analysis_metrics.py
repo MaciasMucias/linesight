@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 from config_files import config_copy
-from trackmania_rl.agents.iqn import iqn_loss
+from trackmania_rl.agents.sac import sac_loss
 
 
 def batched(iterable, n):  # Can be included from itertools with python >=3.12
@@ -68,7 +68,7 @@ def race_time_left_curves(rollout_results, inferer, save_dir, map_name):
                 # print(j)
                 rollout_results_copy["state_float"][frame_number][0] = j
                 per_quantile_output = inferer.infer_network(
-                    rollout_results_copy["frames"][frame_number], rollout_results_copy["state_float"][frame_number], tau
+                    rollout_results_copy["frames"][frame_number], rollout_results_copy["state_float"][frame_number]
                 )  # (iqn_k, n_actions)
                 for i, q_val in enumerate(list(per_quantile_output.mean(axis=0))):
                     # print(i, q_val)
@@ -252,9 +252,9 @@ def get_output_and_target_for_batch(batch, online_network, target_network, num_q
             )  # (batch_size, iqn_n, 1)
 
     losses = {
-        "target_self_loss": iqn_loss(outputs_target_tau2, outputs_target_tau2, tau, num_quantiles, batch_size).cpu().numpy(),
-        "output_self_loss": iqn_loss(outputs_tau3, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
-        "real_loss": iqn_loss(outputs_target_tau2, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
+        "target_self_loss": sac_loss(outputs_target_tau2, outputs_target_tau2, tau, num_quantiles, batch_size).cpu().numpy(),
+        "output_self_loss": sac_loss(outputs_tau3, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
+        "real_loss": sac_loss(outputs_target_tau2, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
     }
 
     return (
