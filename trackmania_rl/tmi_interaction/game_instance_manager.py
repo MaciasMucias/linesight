@@ -263,7 +263,7 @@ class GameInstanceManager:
 
     def request_inputs(self, action: (float, bool, bool), rollout_results: Dict):
         if (
-            len(rollout_results["actions"]) == 0
+            len(rollout_results["actions"]) == 0 or np.any(rollout_results["actions"][-1] != action)
         ):  # Small performance trick, don't update input_state if it doesn't need to be updated
             steer, up, down = action
             self.iface.set_input_state(steer * 65536, up, down)
