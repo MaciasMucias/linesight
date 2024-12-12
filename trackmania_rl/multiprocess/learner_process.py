@@ -578,6 +578,7 @@ def learner_process_fn(
         # ===============================================
         save_frequency_s = 5 * 60
         if time.perf_counter() - time_last_save >= save_frequency_s:
+            
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
             waited_percentage = time_waited_for_workers_since_last_tensorboard_write / time_since_last_save
@@ -666,8 +667,7 @@ def learner_process_fn(
             # TODO: WTF IS THIS
             if online_network.training:
                 online_network.eval()
-            tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
-            per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
+            per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0])
             for i, std in enumerate(list(per_quantile_output.std(axis=0))):
                 step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std
 
@@ -676,14 +676,15 @@ def learner_process_fn(
             # ===============================================
 
             # TODO: Add tensorboard back
-            # walltime_tb = time.time()
-            # for name, param in online_network.named_parameters():
-            #     tensorboard_writer.add_scalar(
-            #         tag=f"layer_{name}_L2",
-            #         scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
-            #         global_step=accumulated_stats["cumul_number_frames_played"],
-            #         walltime=walltime_tb,
-            #     )
+            walltime_tb = time.time()
+            print(online_network.named_parameters())
+            for name, param in online_network.named_parameters():
+                tensorboard_writer.add_scalar(
+                    tag=f"layer_{name}_L2",
+                    scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
+                    global_step=accumulated_stats["cumul_number_frames_played"],
+                    walltime=walltime_tb,
+                )
             # assert len(policy_optimizer.param_groups) == 1
             # assert len(q_optimizer.param_groups) == 1
             # assert len(alpha_optimizer.param_groups) == 1
