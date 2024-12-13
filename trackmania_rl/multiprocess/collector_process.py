@@ -12,7 +12,6 @@ import torch
 from torch import multiprocessing as mp
 
 from config_files import config_copy
-from trackmania_rl import utilities
 from trackmania_rl.agents import sac
 
 
@@ -95,7 +94,6 @@ def collector_process_fn(
         map_name, map_path, zone_centers_filename, is_explo, fill_buffer = next_map_tuple
         map_status = "trained" if map_name in set_maps_trained else "blind"
 
-        inferer.epsilon = utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value)
         inferer.is_explo = is_explo
 
         # ===============================================
@@ -120,7 +118,16 @@ def collector_process_fn(
         )
         rollout_end_time = time.perf_counter()
         rollout_duration = rollout_end_time - rollout_start_time
-        rollout_results["worker_time_in_rollout_percentage"] = rollout_duration / (time.perf_counter() - time_since_last_queue_push)
+        rollout_results["worker_time_in_rollout_percentage"] = rollout_duration / (
+                    time.perf_counter() - time_since_last_queue_push)
+
+        if len(rollout_results["frames"]) > 0:
+            _, _, q_value, _ = inferer.get_exploration_action(
+                rollout_results["frames"][0],
+                rollout_results["state_float"][0]
+            )
+            end_race_stats["q_value_starting_frame"] = q_value
+
         time_since_last_queue_push = time.perf_counter()
         print("", flush=True)
 

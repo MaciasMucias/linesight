@@ -76,10 +76,8 @@ def soft_copy_param(target_link, source_link, tau):
         if source_value.dtype in [torch.float32, torch.float64, torch.float16]:
             linear_combination(target_value, source_value, tau)
         else:
-            # Scalar type
-            # Some modules such as BN has scalar value `num_batches_tracked`
-            target_dict[k] = source_value
-            assert False, "Soft scalar update should not happen"
+            # For non-float parameters (like batch norm counters), just copy directly
+            target_dict[k].copy_(source_value)
 
 
 def custom_weight_decay(target_link, decay_factor):

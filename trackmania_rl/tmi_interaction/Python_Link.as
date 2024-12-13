@@ -165,7 +165,7 @@ int HandleMessage()
             if(debug){
                 print("Server: Set input state message");
             }
-            const int steer = clientSock.ReadUint32();
+            const int steer = clientSock.ReadInt32();
             const bool up = clientSock.ReadUint8()>0;
             const bool brake = clientSock.ReadUint8()>0;
 

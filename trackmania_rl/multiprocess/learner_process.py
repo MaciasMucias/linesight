@@ -49,25 +49,6 @@ def learner_process_fn(
     SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(
         {
             layout_version: {
-                # "eval_agg_ratio": [
-                #     "Multiline",
-                #     [
-                #         "eval_agg_ratio_trained_author",
-                #         "eval_agg_ratio_blind_author",
-                #     ],
-                # ],
-                # "eval_ratio_trained_author": [
-                #     "Multiline",
-                #     [
-                #         "eval_ratio_trained_author",
-                #     ],
-                # ],
-                # "eval_ratio_blind_author": [
-                #     "Multiline",
-                #     [
-                #         "eval_ratio_blind_author",
-                #     ],
-                # ],
                 "eval_race_time_robust": [
                     "Multiline",
                     [
@@ -81,6 +62,28 @@ def learner_process_fn(
                     ],
                 ],
                 "loss": ["Multiline", ["loss$", "loss_test$"]],
+                "policy_metrics": [
+                    "Multiline",
+                    [
+                        "policy_loss",
+                        "policy_loss_test",
+                        "entropy",
+                    ],
+                ],
+                "critic_metrics": [
+                    "Multiline",
+                    [
+                        "critic_loss$",
+                        "critic_loss_test$",
+                    ],
+                ],
+                "temperature": [
+                    "Multiline",
+                    [
+                        "alpha_loss",
+                        "alpha_value",
+                    ],
+                ],
                 "avg_Q": [
                     "Multiline",
                     ["avg_Q"],
@@ -96,12 +99,6 @@ def learner_process_fn(
                     [
                         "grad_norm_history_d9",
                         "grad_norm_history_d98",
-                    ],
-                ],
-                "priorities": [
-                    "Multiline",
-                    [
-                        "priorities",
                     ],
                 ],
             },
@@ -163,35 +160,44 @@ def learner_process_fn(
     log_alpha = torch.zeros(1, requires_grad=True, device="cuda")
 
     # Policy optimizer - for actor networks
-    policy_optimizer = torch.optim.RAdam(
-        # Filter parameters that belong to policy parts
-        [p for name, p in online_network.named_parameters()
-         if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-                                               accumulated_stats["cumul_number_memories_generated"]),
-        eps=config_copy.adam_epsilon,
-        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    )
+    # policy_optimizer = torch.optim.RAdam(
+    #     # Filter parameters that belong to policy parts
+    #     [p for name, p in online_network.named_parameters()
+    #      if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+    #                                            accumulated_stats["cumul_number_memories_generated"]),
+    #     eps=config_copy.adam_epsilon,
+    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    # )
+    #
+    # # Q-network optimizer - for critic networks
+    # q_optimizer = torch.optim.RAdam(
+    #     # Filter parameters that belong to Q networks
+    #     [p for name, p in online_network.named_parameters()
+    #      if any(x in name for x in ['q1_net', 'q2_net'])],
+    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+    #                                            accumulated_stats["cumul_number_memories_generated"]),
+    #     eps=config_copy.adam_epsilon,
+    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    # )
+    #
+    # # Alpha optimizer - for temperature parameter
+    # alpha_optimizer = torch.optim.RAdam(
+    #     [log_alpha],  # Only optimize the temperature parameter
+    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+    #                                            accumulated_stats["cumul_number_memories_generated"]),
+    #     eps=config_copy.adam_epsilon,
+    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    # )
+    base_lr = 3e-4
+    policy_lr = base_lr * 0.5
+    alpha_lr = base_lr * 0.1
+    q_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
+        if any(x in name for x in ['q1_net', 'q2_net'])], lr=base_lr, weight_decay=1e-5)
+    policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
+        if any(x in name for x in ['q1_net', 'q2_net'])], lr=policy_lr, weight_decay=1e-5)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
 
-    # Q-network optimizer - for critic networks
-    q_optimizer = torch.optim.RAdam(
-        # Filter parameters that belong to Q networks
-        [p for name, p in online_network.named_parameters()
-         if any(x in name for x in ['q1_net', 'q2_net'])],
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-                                               accumulated_stats["cumul_number_memories_generated"]),
-        eps=config_copy.adam_epsilon,
-        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    )
-
-    # Alpha optimizer - for temperature parameter
-    alpha_optimizer = torch.optim.RAdam(
-        [log_alpha],  # Only optimize the temperature parameter
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-                                               accumulated_stats["cumul_number_memories_generated"]),
-        eps=config_copy.adam_epsilon,
-        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    )
 
     # optimizer1 = torch_optimizer.Lookahead(optimizer1, k=5, alpha=0.5)
 
@@ -219,7 +225,15 @@ def learner_process_fn(
     tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + tensorboard_suffix)))
 
     loss_history = []
+    critic_loss_history = []
+    policy_loss_history = []
+    alpha_loss_history = []
+    entropy_history = []
     loss_test_history = []
+    critic_loss_test_history = []
+    policy_loss_test_history = []
+    alpha_loss_test_history = []
+    entropy_test_history = []
     train_on_batch_duration_history = []
     grad_norm_history = []
     layer_grad_norm_history = defaultdict(list)
@@ -340,16 +354,14 @@ def learner_process_fn(
         # ===============================================
         race_stats_to_write = {
             f"race_time_ratio_{map_name}": end_race_stats["race_time_for_ratio"] / (rollout_duration * 1000),
-            f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}": end_race_stats[
-                "race_time"
-            ]
-            / 1000,
-            f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}": end_race_stats[
-                "race_finished"
-            ],
-            f"mean_action_gap_{map_name}": -(
-                np.array(rollout_results["q_values"]) - np.array(rollout_results["q_values"]).max(axis=1, initial=None).reshape(-1, 1)
-            ).mean(),
+            f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}":
+                end_race_stats[
+                    "race_time"
+                ] / 1000,
+            f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}":
+                end_race_stats[
+                    "race_finished"
+                ],
             f"single_zone_reached_{map_status}_{map_name}": rollout_results["furthest_zone_idx"],
             "instrumentation__answer_normal_step": end_race_stats["instrumentation__answer_normal_step"],
             "instrumentation__answer_action_step": end_race_stats["instrumentation__answer_action_step"],
@@ -369,18 +381,20 @@ def learner_process_fn(
 
         if end_race_stats["race_finished"]:
             race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
-                end_race_stats["race_time"] / 1000
+                    end_race_stats["race_time"] / 1000
             )
             if not is_explo:
                 accumulated_stats["rolling_mean_ms"][map_name] = (
-                    accumulated_stats["rolling_mean_ms"].get(map_name, config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
-                    * 0.9
-                    + end_race_stats["race_time"] * 0.1
+                        accumulated_stats["rolling_mean_ms"].get(map_name,
+                                                                 config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
+                        * 0.9
+                        + end_race_stats["race_time"] * 0.1
                 )
+
         if (
-            (not is_explo)
-            and end_race_stats["race_finished"]
-            and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
+                (not is_explo)
+                and end_race_stats["race_finished"]
+                and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
         ):
             race_stats_to_write[f"eval_race_time_robust_{map_status}_{map_name}"] = end_race_stats["race_time"] / 1000
             if map_name in reference_times:
@@ -388,23 +402,25 @@ def learner_process_fn(
                     if reference_time_name in reference_times[map_name]:
                         reference_time = reference_times[map_name][reference_time_name]
                         race_stats_to_write[f"eval_ratio_{map_status}_{reference_time_name}_{map_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                                100 * (end_race_stats["race_time"] / 1000) / reference_time
                         )
                         race_stats_to_write[f"eval_agg_ratio_{map_status}_{reference_time_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                                100 * (end_race_stats["race_time"] / 1000) / reference_time
                         )
 
-        for i in [0]:
-            race_stats_to_write[f"q_value_{i}_starting_frame_{map_name}"] = end_race_stats[f"q_value_{i}_starting_frame"]
         if not is_explo:
+            # Log Q-value for starting frame
+            race_stats_to_write[f"q_value_starting_frame_{map_name}"] = end_race_stats["q_value_starting_frame"]
+
+            # Log split times
             for i, split_time in enumerate(
-                [
-                    (e - s) / 1000
-                    for s, e in zip(
+                    [
+                        (e - s) / 1000
+                        for s, e in zip(
                         end_race_stats["cp_time_ms"][:-1],
                         end_race_stats["cp_time_ms"][1:],
                     )
-                ]
+                    ]
             ):
                 race_stats_to_write[f"split_{map_name}_{i}"] = split_time
 
@@ -490,30 +506,58 @@ def learner_process_fn(
             if neural_net_reset_counter >= config_copy.reset_every_n_frames_generated or single_reset_flag != config_copy.single_reset_flag:
                 neural_net_reset_counter = 0
                 single_reset_flag = config_copy.single_reset_flag
-                accumulated_stats["cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
-                # TODO: Update the periodic reset code for the SAC
+                accumulated_stats[
+                    "cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
+
+                # Create fresh untrained network
                 _, untrained_sac_network = make_untrained_sac_network(config_copy.use_jit, False)
                 utilities.soft_copy_param(online_network, untrained_sac_network, config_copy.overall_reset_mul_factor)
 
+                # Reset the last layers of policy and Q networks with stronger reset factor
                 with torch.no_grad():
-                    online_network.A_head[2].weight = utilities.linear_combination(
-                        online_network.A_head[2].weight,
-                        untrained_sac_network.A_head[2].weight,
+                    # Reset last layer of policy network
+                    online_network.steer_mean[-1].weight = utilities.linear_combination(
+                        online_network.steer_mean[-1].weight,
+                        untrained_sac_network.steer_mean[-1].weight,
                         config_copy.last_layer_reset_factor,
                     )
-                    online_network.A_head[2].bias = utilities.linear_combination(
-                        online_network.A_head[2].bias,
-                        untrained_sac_network.A_head[2].bias,
+                    online_network.steer_mean[-1].bias = utilities.linear_combination(
+                        online_network.steer_mean[-1].bias,
+                        untrained_sac_network.steer_mean[-1].bias,
                         config_copy.last_layer_reset_factor,
                     )
-                    online_network.V_head[2].weight = utilities.linear_combination(
-                        online_network.V_head[2].weight,
-                        untrained_sac_network.V_head[2].weight,
+
+                    online_network.steer_log_std[-1].weight = utilities.linear_combination(
+                        online_network.steer_log_std[-1].weight,
+                        untrained_sac_network.steer_log_std[-1].weight,
                         config_copy.last_layer_reset_factor,
                     )
-                    online_network.V_head[2].bias = utilities.linear_combination(
-                        online_network.V_head[2].bias,
-                        untrained_sac_network.V_head[2].bias,
+                    online_network.steer_log_std[-1].bias = utilities.linear_combination(
+                        online_network.steer_log_std[-1].bias,
+                        untrained_sac_network.steer_log_std[-1].bias,
+                        config_copy.last_layer_reset_factor,
+                    )
+
+                    # Reset last layer of Q networks
+                    online_network.q1_net[-1].weight = utilities.linear_combination(
+                        online_network.q1_net[-1].weight,
+                        untrained_sac_network.q1_net[-1].weight,
+                        config_copy.last_layer_reset_factor,
+                    )
+                    online_network.q1_net[-1].bias = utilities.linear_combination(
+                        online_network.q1_net[-1].bias,
+                        untrained_sac_network.q1_net[-1].bias,
+                        config_copy.last_layer_reset_factor,
+                    )
+
+                    online_network.q2_net[-1].weight = utilities.linear_combination(
+                        online_network.q2_net[-1].weight,
+                        untrained_sac_network.q2_net[-1].weight,
+                        config_copy.last_layer_reset_factor,
+                    )
+                    online_network.q2_net[-1].bias = utilities.linear_combination(
+                        online_network.q2_net[-1].bias,
+                        untrained_sac_network.q2_net[-1].bias,
                         config_copy.last_layer_reset_factor,
                     )
 
@@ -531,29 +575,47 @@ def learner_process_fn(
             ):
                 if (random.random() < config_copy.buffer_test_ratio and len(buffer_test) > 0) or len(buffer) == 0:
                     test_start_time = time.perf_counter()
-                    loss, _ = trainer.train_on_batch(buffer_test, do_learn=False)
+                    total_loss, critic_loss, policy_loss, alpha_loss, entropy, _ = trainer.train_on_batch(
+                        buffer_test, do_learn=False)
                     time_testing_since_last_tensorboard_write += time.perf_counter() - test_start_time
-                    loss_test_history.append(loss)
-                    print(f"BT   {loss=:<8.2e}")
+
+                    # Store all test metrics
+                    loss_test_history.append(total_loss)
+                    critic_loss_test_history.append(critic_loss)
+                    policy_loss_test_history.append(policy_loss)
+                    alpha_loss_test_history.append(alpha_loss)
+                    entropy_test_history.append(entropy)
+
+                    print(f"BT   total={total_loss:<8.2e} critic={critic_loss:<8.2e} policy={policy_loss:<8.2e} alpha={alpha_loss:<8.2e}")
                 else:
                     train_start_time = time.perf_counter()
-                    loss, grad_norm = trainer.train_on_batch(buffer, do_learn=True)
+                    # Unpack all losses from the trainer
+                    total_loss, critic_loss, policy_loss, alpha_loss, entropy, grad_norm = trainer.train_on_batch(
+                        buffer, do_learn=True)
                     train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
                     time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]
+
                     accumulated_stats["cumul_number_single_memories_used"] += (
                         4 * config_copy.batch_size
                         if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
                         else config_copy.batch_size
-                    )  # do fewer batches while memory is not full
-                    loss_history.append(loss)
+                    )
+
+                    # Store all metrics in history
+                    loss_history.append(total_loss)
+                    critic_loss_history.append(critic_loss)
+                    policy_loss_history.append(policy_loss)
+                    alpha_loss_history.append(alpha_loss)
+                    entropy_history.append(entropy)
+
                     if not math.isinf(grad_norm):
                         grad_norm_history.append(grad_norm)
-                        # utilities.log_gradient_norms(online_network, layer_grad_norm_history) #~1ms overhead per batch
 
                     accumulated_stats["cumul_number_batches_done"] += 1
-                    print(f"B    {loss=:<8.2e} {grad_norm=:<8.2e} {train_on_batch_duration_history[-1]*1000:<8.1f}")
+                    print(f"B    {total_loss=:<8.2e} {grad_norm=:<8.2e} {train_on_batch_duration_history[-1] * 1000:<8.1f}")
 
-                    utilities.custom_weight_decay(online_network, 1 - weight_decay)
+                    # TODO: bring this back
+                    # utilities.custom_weight_decay(online_network, 1 - weight_decay)
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
                             uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
@@ -569,7 +631,6 @@ def learner_process_fn(
                         accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] += (
                             config_copy.number_memories_trained_on_between_target_network_updates
                         )
-                        # print("UPDATE")
                         utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
             sys.stdout.flush()
 
@@ -599,9 +660,12 @@ def learner_process_fn(
                 "gamma": gamma,
                 "n_steps": config_copy.n_steps,
                 "epsilon": utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value),
-                "epsilon_boltzmann": utilities.from_exponential_schedule(config_copy.epsilon_boltzmann_schedule, shared_steps.value),
                 "learning_rate": learning_rate,
                 "weight_decay": weight_decay,
+                "policy_lr": policy_optimizer.param_groups[0]["lr"],
+                "q_lr": q_optimizer.param_groups[0]["lr"],
+                "alpha_lr": alpha_optimizer.param_groups[0]["lr"],
+                "alpha_value": torch.exp(log_alpha).item(),
                 "discard_non_greedy_actions_in_nsteps": config_copy.discard_non_greedy_actions_in_nsteps,
                 "memory_size": len(buffer),
                 "number_times_single_memory_is_used_before_discard": config_copy.number_times_single_memory_is_used_before_discard,
@@ -611,113 +675,130 @@ def learner_process_fn(
                 "transitions_learned_per_second": transitions_learned_per_second,
             }
             if len(loss_history) > 0 and len(loss_test_history) > 0:
-                step_stats.update(
-                    {
-                        "loss": np.mean(loss_history),
-                        "loss_test": np.mean(loss_test_history),
-                        "train_on_batch_duration": np.median(train_on_batch_duration_history),
-                        "grad_norm_history_q1": np.quantile(grad_norm_history, 0.25),
-                        "grad_norm_history_median": np.quantile(grad_norm_history, 0.5),
-                        "grad_norm_history_q3": np.quantile(grad_norm_history, 0.75),
-                        "grad_norm_history_d9": np.quantile(grad_norm_history, 0.9),
-                        "grad_norm_history_d98": np.quantile(grad_norm_history, 0.98),
-                        "grad_norm_history_max": np.max(grad_norm_history),
-                    }
+                step_stats.update({
+                    "loss": np.mean(loss_history),
+                    "loss_test": np.mean(loss_test_history),
+                    "critic_loss": np.mean(critic_loss_history),
+                    "critic_loss_test": np.mean(critic_loss_test_history),
+                    "policy_loss": np.mean(policy_loss_history),
+                    "policy_loss_test": np.mean(policy_loss_test_history),
+                    "alpha_loss": np.mean(alpha_loss_history),
+                    "alpha_loss_test": np.mean(alpha_loss_test_history),
+                    "entropy": np.mean(entropy_history),
+                    "entropy_test": np.mean(entropy_test_history),
+                    "train_on_batch_duration": np.median(train_on_batch_duration_history),
+                    "grad_norm_history_q1": np.quantile(grad_norm_history, 0.25),
+                    "grad_norm_history_median": np.quantile(grad_norm_history, 0.5),
+                    "grad_norm_history_q3": np.quantile(grad_norm_history, 0.75),
+                    "grad_norm_history_d9": np.quantile(grad_norm_history, 0.9),
+                    "grad_norm_history_d98": np.quantile(grad_norm_history, 0.98),
+                    "grad_norm_history_max": np.max(grad_norm_history),
+                })
+
+            if online_network.training:
+                online_network.eval()
+
+            # Sample a state for statistics
+            sample_state_img = torch.as_tensor(rollout_results["frames"][0]).unsqueeze(0).to("cuda")
+            sample_state_float = torch.as_tensor(rollout_results["state_float"][0]).unsqueeze(0).to("cuda")
+
+            # Use no_grad since we're just collecting statistics
+            with torch.no_grad():
+                # Get policy outputs with deterministic=True to get the mean actions
+                steer_mean, gas_mean, brake_mean, _ = online_network(
+                    sample_state_img,
+                    sample_state_float,
+                    deterministic=True,
+                    with_logprob=False
                 )
-                for key, val in layer_grad_norm_history.items():
-                    step_stats.update(
-                        {
-                            f"{key}_median": np.quantile(val, 0.5),
-                            f"{key}_q3": np.quantile(val, 0.75),
-                            f"{key}_d9": np.quantile(val, 0.9),
-                            f"{key}_c98": np.quantile(val, 0.98),
-                            f"{key}_max": np.max(val),
-                        }
-                    )
-            if isinstance(buffer._sampler, PrioritizedSampler):
-                all_priorities = np.array([buffer._sampler._sum_tree.at(i) for i in range(len(buffer))])
-                step_stats.update(
-                    {
-                        "priorities_min": np.min(all_priorities),
-                        "priorities_q1": np.quantile(all_priorities, 0.1),
-                        "priorities_mean": np.mean(all_priorities),
-                        "priorities_median": np.quantile(all_priorities, 0.5),
-                        "priorities_q3": np.quantile(all_priorities, 0.75),
-                        "priorities_d9": np.quantile(all_priorities, 0.9),
-                        "priorities_c98": np.quantile(all_priorities, 0.98),
-                        "priorities_max": np.max(all_priorities),
-                    }
+
+                # Get non-deterministic actions to see the exploration behavior
+                steer, gas, brake, _ = online_network(
+                    sample_state_img,
+                    sample_state_float,
+                    deterministic=False,
+                    with_logprob=False
                 )
-            for key, value in accumulated_stats.items():
-                if key not in ["alltime_min_ms", "rolling_mean_ms"]:
-                    step_stats[key] = value
-            for key, value in accumulated_stats["alltime_min_ms"].items():
-                step_stats[f"alltime_min_ms_{map_name}"] = value
+
+            # Add policy statistics to step_stats
+            step_stats.update({
+                "action_mean_steer": steer_mean[0].item(),
+                "action_mean_gas": gas_mean[0].item(),
+                "action_mean_brake": brake_mean[0].item(),
+                "action_std_steer": abs(steer - steer_mean).mean().item(),
+                "action_std_gas": abs(gas - gas_mean).mean().item(),
+                "action_std_brake": abs(brake - brake_mean).mean().item()
+            })
 
             loss_history = []
+            critic_loss_history = []
+            policy_loss_history = []
+            alpha_loss_history = []
+            entropy_history = []
             loss_test_history = []
+            critic_loss_test_history = []
+            policy_loss_test_history = []
+            alpha_loss_test_history = []
+            entropy_test_history = []
             train_on_batch_duration_history = []
             grad_norm_history = []
             layer_grad_norm_history = defaultdict(list)
 
             # ===============================================
-            #   COLLECT IQN SPREAD
-            # ===============================================
-            # TODO: WTF IS THIS
-            if online_network.training:
-                online_network.eval()
-            tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
-            per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
-            for i, std in enumerate(list(per_quantile_output.std(axis=0))):
-                step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std
-
-            # ===============================================
             #   WRITE TO TENSORBOARD
             # ===============================================
+            walltime_tb = time.time()
 
-            # TODO: Add tensorboard back
-            # walltime_tb = time.time()
-            # for name, param in online_network.named_parameters():
-            #     tensorboard_writer.add_scalar(
-            #         tag=f"layer_{name}_L2",
-            #         scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
-            #         global_step=accumulated_stats["cumul_number_frames_played"],
-            #         walltime=walltime_tb,
-            #     )
-            # assert len(policy_optimizer.param_groups) == 1
-            # assert len(q_optimizer.param_groups) == 1
-            # assert len(alpha_optimizer.param_groups) == 1
-            # try:
-            #     for policy_p, q_p, alpha_p, (name, _) in zip(
-            #         policy_optimizer.param_groups[0]["params"],
-            #         q_optimizer.param_groups[0]["params"],
-            #         alpha_optimizer.param_groups[0]["params"],
-            #         online_network.named_parameters(),
-            #     ):
-            #         state = optimizer1.state[p]
-            #         exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-            #         mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
-            #         tensorboard_writer.add_scalar(
-            #             tag=f"lr_ratio_{name}_L2",
-            #             scalar_value=np.sqrt((mod_lr**2).mean().detach().cpu().item()),
-            #             global_step=accumulated_stats["cumul_number_frames_played"],
-            #             walltime=walltime_tb,
-            #         )
-            #         tensorboard_writer.add_scalar(
-            #             tag=f"exp_avg_{name}_L2",
-            #             scalar_value=np.sqrt((exp_avg**2).mean().detach().cpu().item()),
-            #             global_step=accumulated_stats["cumul_number_frames_played"],
-            #             walltime=walltime_tb,
-            #         )
-            #         tensorboard_writer.add_scalar(
-            #             tag=f"exp_avg_sq_{name}_L2",
-            #             scalar_value=np.sqrt((exp_avg_sq**2).mean().detach().cpu().item()),
-            #             global_step=accumulated_stats["cumul_number_frames_played"],
-            #             walltime=walltime_tb,
-            #         )
-            # except:
-            #     pass
+            # Basic network statistics
+            for name, param in online_network.named_parameters():
+                # Categorize parameters by network type
+                if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits']):
+                    prefix = "policy"
+                elif any(x in name for x in ['q1_net', 'q2_net']):
+                    prefix = "q"
+                else:
+                    prefix = "shared"
+                print(f"{prefix}/{name}_L2")
+                tensorboard_writer.add_scalar(
+                    tag=f"{prefix}/{name}_L2",
+                    scalar_value=np.sqrt((param ** 2).mean().detach().cpu().item()),
+                    global_step=accumulated_stats["cumul_number_frames_played"],
+                    walltime=walltime_tb,
+                )
 
+            # SAC-specific metrics
+            tensorboard_writer.add_scalar(
+                tag="policy/loss",
+                scalar_value=np.mean(policy_loss_history) if policy_loss_history else 0,
+                global_step=accumulated_stats["cumul_number_frames_played"],
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag="critic/q1_loss",
+                scalar_value=np.mean(critic_loss_history) if critic_loss_history else 0,
+                global_step=accumulated_stats["cumul_number_frames_played"],
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag="alpha/value",
+                scalar_value=torch.exp(trainer.log_alpha).item(),
+                global_step=accumulated_stats["cumul_number_frames_played"],
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag="alpha/loss",
+                scalar_value=np.mean(alpha_loss_history) if alpha_loss_history else 0,
+                global_step=accumulated_stats["cumul_number_frames_played"],
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag="policy/entropy",
+                scalar_value=np.mean(entropy_history) if entropy_history else 0,
+                global_step=accumulated_stats["cumul_number_frames_played"],
+                walltime=walltime_tb,
+            )
+
+            # Write all other statistics
             for k, v in step_stats.items():
                 tensorboard_writer.add_scalar(
                     tag=k,
@@ -773,5 +854,6 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
+            print("Saving")
             utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, q_optimizer, alpha_optimizer, scaler)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

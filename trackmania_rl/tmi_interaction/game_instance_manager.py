@@ -703,7 +703,7 @@ class GameInstanceManager:
 
 
                         (
-                            action, # TODO: after changing the learning algorithm update this to load in steer as well
+                            action,
                             action_was_greedy,
                             q_value,
                             q_values,
@@ -711,8 +711,7 @@ class GameInstanceManager:
 
                         pc8 = time.perf_counter_ns()
                         instrumentation__exploration_policy += pc8 - pc7
-                        print(action)
-                        self.request_inputs(action, rollout_results) # TODO: as above
+                        self.request_inputs(action, rollout_results)
                         self.request_speed(self.running_speed)
 
                         if n_th_action_we_compute == 0:

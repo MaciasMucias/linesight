@@ -1,4 +1,6 @@
 import copy
+import sys
+
 import torch
 import numpy as np
 import numpy.typing as npt
@@ -25,20 +27,26 @@ class SAC_Network(torch.nn.Module):
         self.dense_hidden_dimension = dense_hidden_dimension
         activation_function = torch.nn.LeakyReLU
 
+        self.LOG_STD_MIN = -5
+        self.LOG_STD_MAX = 2
+        self.EPS = 1e-6
+        self.MIN_Q_VALUE = -50.0
+        self.MAX_Q_VALUE = 50.0
+
         # Image processing head
         img_head_channels = [1, 16, 32, 64, 32]
         self.img_head = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=img_head_channels[0], out_channels=img_head_channels[1], kernel_size=(4, 4),
-                            stride=2),
+            torch.nn.Conv2d(img_head_channels[0], img_head_channels[1], kernel_size=(4, 4), stride=2),
+            torch.nn.BatchNorm2d(img_head_channels[1]),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[1], out_channels=img_head_channels[2], kernel_size=(4, 4),
-                            stride=2),
+            torch.nn.Conv2d(img_head_channels[1], img_head_channels[2], kernel_size=(4, 4), stride=2),
+            torch.nn.BatchNorm2d(img_head_channels[2]),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[2], out_channels=img_head_channels[3], kernel_size=(3, 3),
-                            stride=2),
+            torch.nn.Conv2d(img_head_channels[2], img_head_channels[3], kernel_size=(3, 3), stride=2),
+            torch.nn.BatchNorm2d(img_head_channels[3]),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[3], out_channels=img_head_channels[4], kernel_size=(3, 3),
-                            stride=1),
+            torch.nn.Conv2d(img_head_channels[3], img_head_channels[4], kernel_size=(3, 3), stride=1),
+            torch.nn.BatchNorm2d(img_head_channels[4]),
             activation_function(inplace=True),
             torch.nn.Flatten(),
         )
@@ -46,8 +54,10 @@ class SAC_Network(torch.nn.Module):
         # Float feature processing
         self.float_feature_extractor = torch.nn.Sequential(
             torch.nn.Linear(float_inputs_dim, float_hidden_dim),
+            torch.nn.LayerNorm(float_hidden_dim),
             activation_function(inplace=True),
             torch.nn.Linear(float_hidden_dim, float_hidden_dim),
+            torch.nn.LayerNorm(float_hidden_dim),
             activation_function(inplace=True),
         )
 
@@ -57,8 +67,10 @@ class SAC_Network(torch.nn.Module):
         # Shared feature network
         self.shared_net = torch.nn.Sequential(
             torch.nn.Linear(self.dense_input_dimension, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
         )
 
@@ -70,17 +82,21 @@ class SAC_Network(torch.nn.Module):
 
         # Q-value networks
         self.q1_net = torch.nn.Sequential(
-            torch.nn.Linear(dense_hidden_dimension + 3, dense_hidden_dimension),
+            torch.nn.Linear(dense_hidden_dimension + n_actions, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, 1)
         )
 
         self.q2_net = torch.nn.Sequential(
-            torch.nn.Linear(dense_hidden_dimension + 3, dense_hidden_dimension),
+            torch.nn.Linear(dense_hidden_dimension + n_actions, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
+            torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, 1)
         )
@@ -89,43 +105,62 @@ class SAC_Network(torch.nn.Module):
         self.float_inputs_std = torch.tensor(float_inputs_std, dtype=torch.float32).to("cuda")
 
         self.initialize_weights()
+        self.steer_entropy_scale = 1.0
+        self.discrete_entropy_scale = 0.1
 
     def initialize_weights(self) -> None:
         # Initialize convolutional layers
-        for m in self.img_head.modules():
+        for m in self.modules():
             if isinstance(m, torch.nn.Conv2d):
-                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                torch.nn.init.zeros_(m.bias)
+                torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (torch.nn.BatchNorm2d, torch.nn.LayerNorm)):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                torch.nn.init.constant_(m.bias, 0)
 
-        # Initialize float feature extractor
-        for m in self.float_feature_extractor.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                torch.nn.init.zeros_(m.bias)
-
-        # Initialize shared network
-        for m in self.shared_net.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                torch.nn.init.zeros_(m.bias)
-
-        # Initialize policy heads with smaller gain
+            # Special initialization for policy heads
         for module in [self.steer_mean, self.steer_log_std, self.up_logits, self.down_logits]:
-            torch.nn.init.orthogonal_(module.weight, gain=0.01)
-            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.uniform_(module.weight, -3e-3, 3e-3)
+            torch.nn.init.uniform_(module.bias, -3e-3, 3e-3)
 
-        # Initialize Q networks
-        for qnet in [self.q1_net, self.q2_net]:
-            for m in qnet.modules():
-                if isinstance(m, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                    torch.nn.init.zeros_(m.bias)
+            # Special initialization for final Q-network layers
+        for q_net in [self.q1_net, self.q2_net]:
+            final_layer = q_net[-1]
+            torch.nn.init.uniform_(final_layer.weight, -3e-3, 3e-3)
+            torch.nn.init.uniform_(final_layer.bias, -3e-3, 3e-3)
+
+    def preprocess_inputs(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Preprocess inputs consistently, whether coming from inferer or learner
+
+        Args:
+            img: Image tensor, either:
+                - Already normalized [-1, 1] from learner
+                - Raw [0, 255] from inferer
+            float_inputs: Float tensor
+
+        Returns:
+            Tuple of (processed_img, processed_float)
+        """
+        # Check if image needs normalization (from inferer)
+        if img.dtype in (torch.uint8, torch.int32, torch.int64):
+            img = ((img.float() - 128) / 128)
+
+        # Normalize float inputs
+        processed_float = (float_inputs - self.float_inputs_mean) / self.float_inputs_std
+
+        return img, processed_float
 
     def get_features(self, img: torch.Tensor, float_inputs: torch.Tensor) -> torch.Tensor:
+        """Get features using preprocessed inputs"""
+        img, float_inputs = self.preprocess_inputs(img, float_inputs)
+
         img_outputs = self.img_head(img)
-        float_outputs = self.float_feature_extractor(
-            (float_inputs - self.float_inputs_mean) / self.float_inputs_std
-        )
+        float_outputs = self.float_feature_extractor(float_inputs)
         features = torch.cat((img_outputs, float_outputs), 1)
         return self.shared_net(features)
 
@@ -138,7 +173,6 @@ class SAC_Network(torch.nn.Module):
         eps = torch.randn_like(mean)
         sample = mean + eps * std
         log_prob = (-0.5 * ((eps ** 2) + 2.0 * log_std + math.log(2 * math.pi)))
-
         return sample, log_prob
 
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor,
@@ -148,15 +182,28 @@ class SAC_Network(torch.nn.Module):
 
         # Get steering distribution parameters
         mean = self.steer_mean(features)
-        log_std = torch.clamp(self.steer_log_std(features), -20, 2)
+        mean = torch.clamp(mean, -3.0, 3.0)
+        log_std = torch.clamp(self.steer_log_std(features), self.LOG_STD_MIN, self.LOG_STD_MAX)
 
         # Sample steering action
-        raw_steer_action, raw_log_prob = self.sample_normal(mean, log_std, deterministic)
-        steer_action = torch.tanh(raw_steer_action)
+        if deterministic:
+            steer_action = torch.tanh(mean)
+            log_prob_steer = torch.zeros_like(mean)
+        else:
+            std = torch.exp(log_std)
+            noise = torch.randn_like(mean)
+            raw_steer_action = mean + noise * std
+            steer_action = torch.tanh(raw_steer_action)
+
+            # More numerically stable log prob computation
+            log_prob_steer = (-0.5 * (noise.pow(2) + 2 * log_std + math.log(2 * math.pi)) -
+                        torch.log(1 - steer_action.pow(2) + self.EPS))
 
         # Get gas and brake probabilities
         gas_logits = self.up_logits(features)
         brake_logits = self.down_logits(features)
+        gas_logits = torch.clamp(gas_logits, -10.0, 10.0)
+        brake_logits = torch.clamp(brake_logits, -10.0, 10.0)
 
         gas_prob = torch.sigmoid(gas_logits)
         brake_prob = torch.sigmoid(brake_logits)
@@ -166,29 +213,47 @@ class SAC_Network(torch.nn.Module):
             gas_action = (gas_prob > 0.5).float()
             brake_action = (brake_prob > 0.5).float()
         else:
-            gas_action = (torch.rand_like(gas_prob) < gas_prob).float()
-            brake_action = (torch.rand_like(brake_prob) < brake_prob).float()
+            uniform_noise = torch.rand_like(gas_prob)
+            gas_action = (uniform_noise < gas_prob).float()
+            brake_action = (uniform_noise < brake_prob).float()
 
         # Compute log probabilities
-        log_prob_steer = raw_log_prob - torch.log(1 - steer_action.pow(2) + 1e-6)
         log_prob_gas = -F.binary_cross_entropy_with_logits(gas_logits, gas_action, reduction='none')
         log_prob_brake = -F.binary_cross_entropy_with_logits(brake_logits, brake_action, reduction='none')
 
-        log_prob = log_prob_steer + log_prob_gas + log_prob_brake
+        log_prob = (
+                self.steer_entropy_scale * log_prob_steer +
+                self.discrete_entropy_scale * (log_prob_gas + log_prob_brake)
+        )
 
-        if not with_logprob:
+        if with_logprob:
+            log_prob = log_prob + 0.1 * (log_prob_gas + log_prob_brake)
+        else:
             log_prob = torch.zeros_like(log_prob)
 
         return steer_action, gas_action, brake_action, log_prob
 
     @torch.jit.export
-    def q_values(self, img: torch.Tensor, float_inputs: torch.Tensor,
-                 steer: torch.Tensor, gas: torch.Tensor, brake: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def q_values(self, img, float_inputs, steer, gas, brake):
         features = self.get_features(img, float_inputs)
-        # Concatenate features with actions
-        actions = torch.cat([steer, gas, brake], dim=-1)
-        sa = torch.cat([features, actions], dim=-1)
-        return self.q1_net(sa), self.q2_net(sa)
+        # Create new tensors instead of inplace operations
+        actions = torch.cat([
+            steer.detach().clone(),
+            gas.detach().clone(),
+            brake.detach().clone()
+        ], dim=-1)
+        sa = torch.cat([features.detach().clone(), actions], dim=-1)
+
+        q1 = self.q1_net(sa)
+        q2 = self.q2_net(sa)
+
+        # Create new tensors instead of inplace clamping
+        q1 = torch.max(torch.min(q1, torch.tensor(self.MAX_Q_VALUE, device=q1.device)),
+                       torch.tensor(self.MIN_Q_VALUE, device=q1.device))
+        q2 = torch.max(torch.min(q2, torch.tensor(self.MAX_Q_VALUE, device=q2.device)),
+                       torch.tensor(self.MIN_Q_VALUE, device=q2.device))
+
+        return q1, q2
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -208,9 +273,6 @@ def sac_loss(
         gammas: torch.Tensor,
         log_alpha: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute SAC losses for critic, actor and temperature
-    """
     alpha = log_alpha.exp()
 
     # Get current Q values
@@ -231,26 +293,39 @@ def sac_loss(
         )
         target_q = torch.min(target_q1, target_q2)
 
-        # Compute target value with entropy
-        target_value = target_q - alpha * next_log_prob
-        q_target = rewards + gammas * target_value
+        # Explicitly reshape next_log_prob
+        next_log_prob = next_log_prob.view(-1, 1)  # [batch_size, 1]
 
-    # Q-function loss (critic loss)
-    q1_loss = F.mse_loss(current_q1, q_target)
-    q2_loss = F.mse_loss(current_q2, q_target)
+        # Compute target value with entropy - note the sign change for entropy term
+        target_value = target_q - alpha * next_log_prob
+
+        # Ensure rewards and gammas are correct shape
+        rewards = rewards.view(-1, 1)  # [batch_size, 1]
+        gammas = gammas.view(-1, 1)  # [batch_size, 1]
+
+        # Calculate target
+        q_target = rewards + gammas * target_value
+        q_target = q_target.view(-1, 1).detach()  # Force correct shape
+
+    # Q-function loss (critic loss) - MSE between current and target Q-values
+    q1_loss = F.mse_loss(current_q1, q_target, reduction='mean')
+    q2_loss = F.mse_loss(current_q2, q_target, reduction='mean')
     critic_loss = q1_loss + q2_loss
 
-    # Policy loss (actor loss)
+    # Policy loss (actor loss) - sample new actions for the policy gradient
     steer, gas, brake, log_prob = online_network(
         state_img, state_float, deterministic=False, with_logprob=True
     )
     q1_pi, q2_pi = online_network.q_values(state_img, state_float, steer, gas, brake)
     min_q_pi = torch.min(q1_pi, q2_pi)
 
-    policy_loss = (alpha * log_prob - min_q_pi).mean()
+    log_prob = log_prob.view(-1, 1)
+    # Corrected policy loss: maximize Q-value and entropy
 
-    # Temperature loss
-    target_entropy = -3.0  # Heuristic value: -dim(A) for continuous actions
+    policy_loss = (-min_q_pi - alpha * log_prob).mean()
+
+    # Temperature loss - automatic entropy tuning
+    target_entropy = -3.0  # Can be tuned based on action space
     alpha_loss = -(log_alpha * (log_prob.detach() + target_entropy)).mean()
 
     return critic_loss, policy_loss, alpha_loss
@@ -276,114 +351,170 @@ class Trainer:
         self.scaler = scaler
         self.batch_size = batch_size
         self.log_alpha = log_alpha
+        self.train_steps = 0
 
-    def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool) -> Tuple[float, float]:
-        """
-        Implements one iteration of SAC training
-        """
-        self.policy_optimizer.zero_grad(set_to_none=True)
-        self.q_optimizer.zero_grad(set_to_none=True)
-        self.alpha_optimizer.zero_grad(set_to_none=True)
+        # Compute target entropy based on action space
+        # -1 for steering (continuous) and -0.98 for each discrete action
+        self.target_entropy = -(1 + 2 * 0.98)
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            batch, batch_info = buffer.sample(self.batch_size, return_info=True)
-            (
-                state_img_tensor,
-                state_float_tensor,
-                actions,
-                rewards,
-                next_state_img_tensor,
-                next_state_float_tensor,
-                gammas,
-            ) = batch
+    def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
+        try:
+            critic_grad_norm = 0.0
+            policy_grad_norm = 0.0
 
-            # Split the actions into steer, gas, brake
-            steer = actions[:, 0].unsqueeze(-1)
-            gas = actions[:, 1].unsqueeze(-1)
-            brake = actions[:, 2].unsqueeze(-1)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                # Get batch
+                batch, batch_info = buffer.sample(self.batch_size, return_info=True)
+                (state_img_tensor, state_float_tensor, actions, rewards,
+                 next_state_img_tensor, next_state_float_tensor, gammas) = batch
 
-            if config_copy.prio_alpha > 0:
-                IS_weights = torch.from_numpy(batch_info["_weight"]).to("cuda", non_blocking=True)
+                # === Critic Update ===
+                if do_learn:
+                    self.q_optimizer.zero_grad(set_to_none=True)
 
-            critic_loss, policy_loss, alpha_loss = sac_loss(
-                self.online_network,
-                self.target_network,
-                state_img_tensor,
-                state_float_tensor,
-                (steer, gas, brake),
-                rewards,
-                next_state_img_tensor,
-                next_state_float_tensor,
-                gammas,
-                self.log_alpha
-            )
+                    with torch.set_grad_enabled(True):
+                        # Fresh forward pass for critic
+                        current_q1, current_q2 = self.online_network.q_values(
+                            state_img_tensor,
+                            state_float_tensor,
+                            actions[:, 0].unsqueeze(-1),
+                            actions[:, 1].unsqueeze(-1),
+                            actions[:, 2].unsqueeze(-1)
+                        )
 
-            # Apply importance sampling weights if using prioritized replay
-            if config_copy.prio_alpha > 0:
-                critic_loss = (critic_loss * IS_weights).mean()
-                policy_loss = (policy_loss * IS_weights).mean()
-                alpha_loss = (alpha_loss * IS_weights).mean()
+                        with torch.no_grad():
+                            # Compute targets
+                            next_actions = self.target_network(
+                                next_state_img_tensor,
+                                next_state_float_tensor,
+                                deterministic=False,
+                                with_logprob=True
+                            )
+                            next_steer, next_gas, next_brake, next_log_prob = next_actions
 
-            total_loss = critic_loss + policy_loss + alpha_loss
+                            target_q1, target_q2 = self.target_network.q_values(
+                                next_state_img_tensor,
+                                next_state_float_tensor,
+                                next_steer,
+                                next_gas,
+                                next_brake
+                            )
 
-            if do_learn:
-                # Update critics
-                self.scaler.scale(critic_loss).backward(retain_graph=True)
+                            alpha = self.log_alpha.exp()
+                            min_target_q = torch.min(target_q1, target_q2)
+                            target_value = min_target_q - alpha * next_log_prob.view(-1, 1)
+                            q_target = rewards.view(-1, 1) + gammas.view(-1, 1) * target_value
 
-                # Update policy
-                self.scaler.scale(policy_loss).backward(retain_graph=True)
+                        # Compute critic loss
+                        critic_loss = F.mse_loss(current_q1, q_target) + F.mse_loss(current_q2, q_target)
 
-                # Update temperature
-                self.scaler.scale(alpha_loss).backward()
+                        # Update critic
+                        self.scaler.scale(critic_loss).backward()
+                        self.scaler.unscale_(self.q_optimizer)
+                        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            [p for name, p in self.online_network.named_parameters()
+                             if any(x in name for x in ['q1_net', 'q2_net'])],
+                            float('inf')
+                        ).item()
+                        self.scaler.step(self.q_optimizer)
+                        self.scaler.update()
 
-                # Gradient clipping
-                self.scaler.unscale_(self.policy_optimizer)
-                self.scaler.unscale_(self.q_optimizer)
-                self.scaler.unscale_(self.alpha_optimizer)
+                # === Policy Update ===
+                if do_learn:
+                    self.policy_optimizer.zero_grad(set_to_none=True)
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.online_network.parameters(),
-                    config_copy.clip_grad_norm
-                ).detach().cpu().item()
+                    with torch.set_grad_enabled(True):
+                        # Fresh forward pass for policy
+                        pi_steer, pi_gas, pi_brake, log_prob = self.online_network(
+                            state_img_tensor,
+                            state_float_tensor,
+                            deterministic=False,
+                            with_logprob=True
+                        )
 
-                torch.nn.utils.clip_grad_value_(
-                    self.online_network.parameters(),
-                    config_copy.clip_grad_value
+                        q1_pi, q2_pi = self.online_network.q_values(
+                            state_img_tensor,
+                            state_float_tensor,
+                            pi_steer,
+                            pi_gas,
+                            pi_brake
+                        )
+
+                        min_q_pi = torch.min(q1_pi, q2_pi)
+                        alpha = self.log_alpha.exp()
+
+                        # Compute policy loss
+                        policy_loss = (alpha * log_prob - min_q_pi).mean()
+
+                        # Update policy
+                        self.scaler.scale(policy_loss).backward()
+                        self.scaler.unscale_(self.policy_optimizer)
+                        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            [p for name, p in self.online_network.named_parameters()
+                             if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+                            float('inf')
+                        ).item()
+                        self.scaler.step(self.policy_optimizer)
+                        self.scaler.update()
+
+                    # === Alpha Update ===
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+                    self.scaler.scale(alpha_loss).backward()
+                    self.scaler.unscale_(self.alpha_optimizer)
+                    self.scaler.step(self.alpha_optimizer)
+                    self.scaler.update()
+
+                    # === Target Network Update ===
+                    with torch.no_grad():
+                        for target_param, online_param in zip(
+                                self.target_network.parameters(),
+                                self.online_network.parameters()
+                        ):
+                            target_param.data.copy_(
+                                0.995 * target_param.data + 0.005 * online_param.data
+                            )
+
+                # Return values even when not learning
+                return (
+                    float(critic_loss + policy_loss + alpha_loss),
+                    float(critic_loss),
+                    float(policy_loss),
+                    float(alpha_loss),
+                    float(-log_prob.mean()),
+                    max(critic_grad_norm, policy_grad_norm)
                 )
 
-                # Optimizer steps
-                self.scaler.step(self.policy_optimizer)
-                self.scaler.step(self.q_optimizer)
-                self.scaler.step(self.alpha_optimizer)
-                self.scaler.update()
-            else:
-                grad_norm = 0
-
-        return total_loss.detach().cpu(), grad_norm
+        except Exception as e:
+            print(f"Unexpected error in train_on_batch: {str(e)}")
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 
 class Inferer:
-    def __init__(self, inference_network):
+    """Handles inference for SAC policy network"""
+    __slots__ = ("inference_network", "is_explo")
+
+    def __init__(self, inference_network: torch.nn.Module):
         self.inference_network = inference_network
-        self.epsilon = None  # For compatibility with exploration logic
-        self.epsilon_boltzmann = None
         self.is_explo = None
 
-    def infer_network(self, img_inputs_uint8: np.ndarray, float_inputs: np.ndarray) -> np.ndarray:
-        """
-        Perform inference on a single state
-        """
-        with torch.no_grad():
-            state_img_tensor = (
-                                       torch.from_numpy(img_inputs_uint8)
-                                       .unsqueeze(0)
-                                       .to("cuda", memory_format=torch.channels_last, non_blocking=True,
-                                           dtype=torch.float32)
-                                       - 128
-                               ) / 128
-            state_float_tensor = torch.from_numpy(np.expand_dims(float_inputs, axis=0)).to("cuda", non_blocking=True)
+    def _prepare_tensors(self, img_inputs_uint8: np.ndarray, float_inputs: np.ndarray) -> tuple[
+        torch.Tensor, torch.Tensor]:
+        """Prepare input tensors for network inference"""
+        state_img_tensor = (
+            torch.from_numpy(img_inputs_uint8)
+            .unsqueeze(0)
+            .to("cuda", memory_format=torch.channels_last, non_blocking=True)
+        )
 
-            # Get actions from policy network
+        state_float_tensor = torch.from_numpy(np.expand_dims(float_inputs, axis=0)).to("cuda", non_blocking=True)
+        return state_img_tensor, state_float_tensor
+
+    def infer_network(self, img_inputs_uint8: np.ndarray, float_inputs: np.ndarray) -> np.ndarray:
+        """Get Q-values for a given state using deterministic policy"""
+        with torch.no_grad():
+            state_img_tensor, state_float_tensor = self._prepare_tensors(img_inputs_uint8, float_inputs)
+
             steer, gas, brake, _ = self.inference_network(
                 state_img_tensor,
                 state_float_tensor,
@@ -391,37 +522,24 @@ class Inferer:
                 with_logprob=False
             )
 
-            # Get Q-values for these actions
             q1, q2 = self.inference_network.q_values(
                 state_img_tensor,
                 state_float_tensor,
                 steer, gas, brake
             )
 
-            q_values = torch.min(q1, q2).cpu().numpy()
-
-            return q_values
+            return torch.min(q1, q2).cpu().numpy()
 
     def get_exploration_action(
             self,
             img_inputs_uint8: np.ndarray,
             float_inputs: np.ndarray
-    ) -> Tuple[np.ndarray, bool, float, np.ndarray]:
-        """
-        Select an action using the policy, with potential exploration
-        Returns: action, is_greedy, value, q_values
-        """
+    ) -> tuple[np.ndarray, bool, float, np.ndarray]:
+        """Select an action using the policy, with optional exploration during training"""
         with torch.no_grad():
-            state_img_tensor = (
-                                       torch.from_numpy(img_inputs_uint8)
-                                       .unsqueeze(0)
-                                       .to("cuda", memory_format=torch.channels_last, non_blocking=True,
-                                           dtype=torch.float32)
-                                       - 128
-                               ) / 128
-            state_float_tensor = torch.from_numpy(np.expand_dims(float_inputs, axis=0)).to("cuda", non_blocking=True)
+            state_img_tensor, state_float_tensor = self._prepare_tensors(img_inputs_uint8, float_inputs)
 
-            # Get deterministic action (for value estimation)
+            # Get deterministic action for value estimation
             steer_det, gas_det, brake_det, _ = self.inference_network(
                 state_img_tensor,
                 state_float_tensor,
@@ -429,7 +547,6 @@ class Inferer:
                 with_logprob=False
             )
 
-            # Get Q-values for deterministic action
             q1, q2 = self.inference_network.q_values(
                 state_img_tensor,
                 state_float_tensor,
@@ -437,7 +554,7 @@ class Inferer:
             )
             value = torch.min(q1, q2).item()
 
-            # During exploration, sample from the policy
+            # During exploration, sample from policy
             if self.is_explo:
                 steer, gas, brake, _ = self.inference_network(
                     state_img_tensor,
@@ -448,24 +565,19 @@ class Inferer:
             else:
                 steer, gas, brake = steer_det, gas_det, brake_det
 
-            # Compose action array
             action = np.array([
                 steer.cpu().numpy()[0, 0],
                 gas.cpu().numpy()[0, 0],
                 brake.cpu().numpy()[0, 0]
             ])
 
-            # Check if this was a greedy action
-            is_greedy = np.allclose(
-                action,
-                np.array([
-                    steer_det.cpu().numpy()[0, 0],
-                    gas_det.cpu().numpy()[0, 0],
-                    brake_det.cpu().numpy()[0, 0]
-                ])
-            )
+            deterministic_action = np.array([
+                steer_det.cpu().numpy()[0, 0],
+                gas_det.cpu().numpy()[0, 0],
+                brake_det.cpu().numpy()[0, 0]
+            ])
 
-            return action, is_greedy, value, q1.cpu().numpy()
+            return action, np.allclose(action, deterministic_action), value, q1.cpu().numpy()
 
 
 def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SAC_Network, SAC_Network]:
@@ -490,7 +602,7 @@ def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SAC_Netwo
         float_hidden_dim=config_copy.float_hidden_dim,
         conv_head_output_dim=config_copy.conv_head_output_dim,
         dense_hidden_dimension=config_copy.dense_hidden_dimension,
-        n_actions=len(config_copy.inputs),
+        n_actions=len(["steer", "gas", "break"]),
         float_inputs_mean=config_copy.float_inputs_mean,
         float_inputs_std=config_copy.float_inputs_std,
     )
