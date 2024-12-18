@@ -157,49 +157,35 @@ def learner_process_fn(
     neural_net_reset_counter = 0
     single_reset_flag = config_copy.single_reset_flag
 
-    log_alpha = torch.zeros(1, requires_grad=True, device="cuda")
 
-    # Policy optimizer - for actor networks
-    # policy_optimizer = torch.optim.RAdam(
-    #     # Filter parameters that belong to policy parts
-    #     [p for name, p in online_network.named_parameters()
-    #      if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
-    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-    #                                            accumulated_stats["cumul_number_memories_generated"]),
-    #     eps=config_copy.adam_epsilon,
-    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    # )
-    #
-    # # Q-network optimizer - for critic networks
-    # q_optimizer = torch.optim.RAdam(
-    #     # Filter parameters that belong to Q networks
-    #     [p for name, p in online_network.named_parameters()
-    #      if any(x in name for x in ['q1_net', 'q2_net'])],
-    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-    #                                            accumulated_stats["cumul_number_memories_generated"]),
-    #     eps=config_copy.adam_epsilon,
-    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    # )
-    #
-    # # Alpha optimizer - for temperature parameter
-    # alpha_optimizer = torch.optim.RAdam(
-    #     [log_alpha],  # Only optimize the temperature parameter
-    #     lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
-    #                                            accumulated_stats["cumul_number_memories_generated"]),
-    #     eps=config_copy.adam_epsilon,
-    #     betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    # )
-    base_lr = 3e-4
-    policy_lr = base_lr * 0.5
-    alpha_lr = base_lr * 0.1
+    critic_lr = utilities.from_exponential_schedule(
+        config_copy.critic_lr_schedule, accumulated_stats["cumul_number_memories_generated"],
+    )
+    policy_lr = utilities.from_exponential_schedule(
+        config_copy.policy_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
+    )
+    alpha_lr = utilities.from_exponential_schedule(
+        config_copy.alpha_lr_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
+    )
+
+    log_alpha = torch.zeros(1 * config_copy.alpha_initial_value, requires_grad=True, device="cuda")
     q_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['q1_net', 'q2_net'])], lr=base_lr, weight_decay=1e-5)
+        if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+                                        lr=critic_lr,
+                                        eps=config_copy.adam_epsilon,
+                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+                                        weight_decay=1e-5)
     policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['q1_net', 'q2_net'])], lr=policy_lr, weight_decay=1e-5)
-    alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
+        if any(x in name for x in ['q1_net', 'q2_net'])],
+                                        lr=policy_lr,
+                                        eps=config_copy.adam_epsilon,
+                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+                                        weight_decay=1e-5)
+    alpha_optimizer = torch.optim.Adam([log_alpha],
+                                       lr=alpha_lr,
+                                       eps=config_copy.adam_epsilon,
+                                       betas=(config_copy.adam_beta1, config_copy.adam_beta2))
 
-
-    # optimizer1 = torch_optimizer.Lookahead(optimizer1, k=5, alpha=0.5)
 
     scaler = torch.amp.GradScaler("cuda")
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
@@ -517,25 +503,25 @@ def learner_process_fn(
                 # Reset the last layers of policy and Q networks with stronger reset factor
                 with torch.no_grad():
                     # Reset last layer of policy network
-                    online_network.steer_mean[-1].weight = utilities.linear_combination(
-                        online_network.steer_mean[-1].weight,
-                        untrained_sac_network.steer_mean[-1].weight,
+                    online_network.policy_mean[-1].weight = utilities.linear_combination(
+                        online_network.policy_mean[-1].weight,
+                        untrained_sac_network.policy_mean[-1].weight,
                         config_copy.last_layer_reset_factor,
                     )
-                    online_network.steer_mean[-1].bias = utilities.linear_combination(
-                        online_network.steer_mean[-1].bias,
-                        untrained_sac_network.steer_mean[-1].bias,
+                    online_network.policy_mean[-1].bias = utilities.linear_combination(
+                        online_network.policy_mean[-1].bias,
+                        untrained_sac_network.policy_mean[-1].bias,
                         config_copy.last_layer_reset_factor,
                     )
 
-                    online_network.steer_log_std[-1].weight = utilities.linear_combination(
-                        online_network.steer_log_std[-1].weight,
-                        untrained_sac_network.steer_log_std[-1].weight,
+                    online_network.policy_log_std[-1].weight = utilities.linear_combination(
+                        online_network.policy_log_std[-1].weight,
+                        untrained_sac_network.policy_log_std[-1].weight,
                         config_copy.last_layer_reset_factor,
                     )
-                    online_network.steer_log_std[-1].bias = utilities.linear_combination(
-                        online_network.steer_log_std[-1].bias,
-                        untrained_sac_network.steer_log_std[-1].bias,
+                    online_network.policy_log_std[-1].bias = utilities.linear_combination(
+                        online_network.policy_log_std[-1].bias,
+                        untrained_sac_network.policy_log_std[-1].bias,
                         config_copy.last_layer_reset_factor,
                     )
 
@@ -576,22 +562,21 @@ def learner_process_fn(
             ):
                 if (random.random() < config_copy.buffer_test_ratio and len(buffer_test) > 0) or len(buffer) == 0:
                     test_start_time = time.perf_counter()
-                    total_loss, critic_loss, policy_loss, alpha_loss, entropy, _ = trainer.train_on_batch(
+                    critic_loss, policy_loss, alpha_loss, entropy, _ = trainer.train_on_batch(
                         buffer_test, do_learn=False)
                     time_testing_since_last_tensorboard_write += time.perf_counter() - test_start_time
 
                     # Store all test metrics
-                    loss_test_history.append(total_loss)
                     critic_loss_test_history.append(critic_loss)
                     policy_loss_test_history.append(policy_loss)
                     alpha_loss_test_history.append(alpha_loss)
                     entropy_test_history.append(entropy)
 
-                    print(f"BT   total={total_loss:<8.2e} critic={critic_loss:<8.2e} policy={policy_loss:<8.2e} alpha={alpha_loss:<8.2e}")
+                    print(f"BT   critic={critic_loss:<8.2e} policy={policy_loss:<8.2e} alpha={alpha_loss:<8.2e}")
                 else:
                     train_start_time = time.perf_counter()
                     # Unpack all losses from the trainer
-                    total_loss, critic_loss, policy_loss, alpha_loss, entropy, grad_norm = trainer.train_on_batch(
+                    critic_loss, policy_loss, alpha_loss, entropy, grad_norm = trainer.train_on_batch(
                         buffer, do_learn=True)
                     train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
                     time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]

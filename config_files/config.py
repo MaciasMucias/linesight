@@ -88,11 +88,6 @@ float_input_dim = 27 + 3 * n_zone_centers_in_inputs + 3 * n_prev_actions_in_inpu
 float_hidden_dim = 256
 conv_head_output_dim = 5632
 dense_hidden_dimension = 1024
-iqn_embedding_dimension = 64
-iqn_n = 8  # must be an even number because we sample tau symmetrically around 0.5
-iqn_k = 32  # must be an even number because we sample tau symmetrically around 0.5
-iqn_kappa = 5e-3
-use_ddqn = False
 
 prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER paper 0.6
 prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
@@ -105,12 +100,27 @@ memory_size_schedule = [
     (5_000_000 * global_schedule_speed, (100_000, 75_000)),
     (7_000_000 * global_schedule_speed, (200_000, 150_000)),
 ]
-lr_schedule = [
+critic_lr_schedule = [
     (0, 1e-3),
     (3_000_000 * global_schedule_speed, 5e-5),
     (12_000_000 * global_schedule_speed, 5e-5),
     (15_000_000 * global_schedule_speed, 1e-5),
 ]
+policy_lr_schedule = [
+    (0, 1e-3),
+    (3_000_000 * global_schedule_speed, 5e-5),
+    (12_000_000 * global_schedule_speed, 5e-5),
+    (15_000_000 * global_schedule_speed, 1e-5),
+]
+alpha_lr_schedule = [
+    (0, 1e-3),
+    (3_000_000 * global_schedule_speed, 5e-5),
+    (12_000_000 * global_schedule_speed, 5e-5),
+    (15_000_000 * global_schedule_speed, 1e-5),
+]
+alpha_initial_value = 0.2
+polyak = 0.995
+
 tensorboard_suffix_schedule = [
     (0, ""),
     (6_000_000 * global_schedule_speed, "_2"),

@@ -7,6 +7,8 @@ import numpy.typing as npt
 import torch.nn.functional as F
 from typing import Tuple
 import math
+
+from torch import Tensor
 from torch.optim import Optimizer
 from trackmania_rl.buffer_management import ReplayBuffer
 from config_files import config_copy
@@ -27,11 +29,9 @@ class SAC_Network(torch.nn.Module):
         self.dense_hidden_dimension = dense_hidden_dimension
         activation_function = torch.nn.LeakyReLU
 
-        self.LOG_STD_MIN = -5
+        self.LOG_STD_MIN = -20
         self.LOG_STD_MAX = 2
-        self.EPS = 1e-6
-        self.MIN_Q_VALUE = -50.0
-        self.MAX_Q_VALUE = 50.0
+        self.EPS = 1e-7
 
         # Image processing head
         img_head_channels = [1, 16, 32, 64, 32]
@@ -75,10 +75,8 @@ class SAC_Network(torch.nn.Module):
         )
 
         # Policy heads
-        self.steer_mean = torch.nn.Linear(dense_hidden_dimension, 1)
-        self.steer_log_std = torch.nn.Linear(dense_hidden_dimension, 1)
-        self.up_logits = torch.nn.Linear(dense_hidden_dimension, 1)
-        self.down_logits = torch.nn.Linear(dense_hidden_dimension, 1)
+        self.policy_mean = torch.nn.Linear(dense_hidden_dimension, n_actions)
+        self.policy_log_std = torch.nn.Linear(dense_hidden_dimension, n_actions)
 
         # Q-value networks
         self.q1_net = torch.nn.Sequential(
@@ -123,7 +121,7 @@ class SAC_Network(torch.nn.Module):
                 torch.nn.init.constant_(m.bias, 0)
 
             # Special initialization for policy heads
-        for module in [self.steer_mean, self.steer_log_std, self.up_logits, self.down_logits]:
+        for module in [self.policy_mean, self.policy_log_std, self.up_logits, self.down_logits]:
             torch.nn.init.uniform_(module.weight, -3e-3, 3e-3)
             torch.nn.init.uniform_(module.bias, -3e-3, 3e-3)
 
@@ -164,94 +162,40 @@ class SAC_Network(torch.nn.Module):
         features = torch.cat((img_outputs, float_outputs), 1)
         return self.shared_net(features)
 
-    def sample_normal(self, mean: torch.Tensor, log_std: torch.Tensor, deterministic: bool) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        if deterministic:
-            return mean, torch.zeros_like(mean)
-
-        std = torch.exp(log_std)
-        eps = torch.randn_like(mean)
-        sample = mean + eps * std
-        log_prob = (-0.5 * ((eps ** 2) + 2.0 * log_std + math.log(2 * math.pi)))
-        return sample, log_prob
-
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor,
-                deterministic: bool, with_logprob: bool) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                deterministic: bool, with_logprob: bool) -> tuple[Tensor, Tensor | None]:
         features = self.get_features(img, float_inputs)
 
         # Get steering distribution parameters
-        mean = self.steer_mean(features)
+        mean = self.policy_mean(features)
         mean = torch.clamp(mean, -3.0, 3.0)
-        log_std = torch.clamp(self.steer_log_std(features), self.LOG_STD_MIN, self.LOG_STD_MAX)
-
-        # Sample steering action
+        log_std = torch.clamp(self.policy_log_std(features), self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = torch.exp(log_std)
+        policy_distribution = torch.distributions.Normal(mean, std)
         if deterministic:
-            steer_action = torch.tanh(mean)
-            log_prob_steer = torch.zeros_like(mean)
+            policy_action = mean
         else:
-            std = torch.exp(log_std)
-            noise = torch.randn_like(mean)
-            raw_steer_action = mean + noise * std
-            steer_action = torch.tanh(raw_steer_action)
-
-            # More numerically stable log prob computation
-            log_prob_steer = (-0.5 * (noise.pow(2) + 2 * log_std + math.log(2 * math.pi)) -
-                        torch.log(1 - steer_action.pow(2) + self.EPS))
-
-        # Get gas and brake probabilities
-        gas_logits = self.up_logits(features)
-        brake_logits = self.down_logits(features)
-        gas_logits = torch.clamp(gas_logits, -10.0, 10.0)
-        brake_logits = torch.clamp(brake_logits, -10.0, 10.0)
-
-        gas_prob = torch.sigmoid(gas_logits)
-        brake_prob = torch.sigmoid(brake_logits)
-
-        # Sample discrete actions
-        if deterministic:
-            gas_action = (gas_prob > 0.5).float()
-            brake_action = (brake_prob > 0.5).float()
-        else:
-            uniform_noise = torch.rand_like(gas_prob)
-            gas_action = (uniform_noise < gas_prob).float()
-            brake_action = (uniform_noise < brake_prob).float()
-
-        # Compute log probabilities
-        log_prob_gas = -F.binary_cross_entropy_with_logits(gas_logits, gas_action, reduction='none')
-        log_prob_brake = -F.binary_cross_entropy_with_logits(brake_logits, brake_action, reduction='none')
-
-        log_prob = (
-                self.steer_entropy_scale * log_prob_steer +
-                self.discrete_entropy_scale * (log_prob_gas + log_prob_brake)
-        )
+            policy_action = policy_distribution.sample()
 
         if with_logprob:
-            log_prob = log_prob + 0.1 * (log_prob_gas + log_prob_brake)
+            policy_logprob = policy_distribution.log_prob(policy_action).sum(axis=-1)
+            policy_logprob -= (2 * (np.log(2) - policy_action - F.softplus(-2 * policy_action))).sum(axis=1)
         else:
-            log_prob = torch.zeros_like(log_prob)
+            policy_logprob = None
 
-        return steer_action, gas_action, brake_action, log_prob
+        policy_action = torch.tanh(policy_action)
+
+
+        return policy_action, policy_logprob
 
     @torch.jit.export
-    def q_values(self, img, float_inputs, steer, gas, brake):
+    def q_values(self, img, float_inputs, actions):
         features = self.get_features(img, float_inputs)
         # Create new tensors instead of inplace operations
-        actions = torch.cat([
-            steer.detach().clone(),
-            gas.detach().clone(),
-            brake.detach().clone()
-        ], dim=-1)
         sa = torch.cat([features.detach().clone(), actions], dim=-1)
 
         q1 = self.q1_net(sa)
         q2 = self.q2_net(sa)
-
-        # Create new tensors instead of inplace clamping
-        q1 = torch.max(torch.min(q1, torch.tensor(self.MAX_Q_VALUE, device=q1.device)),
-                       torch.tensor(self.MIN_Q_VALUE, device=q1.device))
-        q2 = torch.max(torch.min(q2, torch.tensor(self.MAX_Q_VALUE, device=q2.device)),
-                       torch.tensor(self.MIN_Q_VALUE, device=q2.device))
 
         return q1, q2
 
@@ -366,125 +310,62 @@ class Trainer:
                 # Get batch
                 batch, batch_info = buffer.sample(self.batch_size, return_info=True)
                 (state_img_tensor, state_float_tensor, actions, rewards,
-                 next_state_img_tensor, next_state_float_tensor, gammas, done) = batch
+                 next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
 
-                # === Critic Update ===
-                if do_learn:
-                    self.q_optimizer.zero_grad(set_to_none=True)
+                policy_action, policy_logprob = self.online_network(state_img_tensor, state_float_tensor)
 
-                    with torch.set_grad_enabled(True):
-                        # Fresh forward pass for critic
-                        current_q1, current_q2 = self.online_network.q_values(
-                            state_img_tensor,
-                            state_float_tensor,
-                            actions[:, 0].unsqueeze(-1),
-                            actions[:, 1].unsqueeze(-1),
-                            actions[:, 2].unsqueeze(-1)
-                        )
+                alpha_t = torch.exp(self.log_alpha.detach())
+                loss_alpha = -(self.log_alpha * (policy_logprob + self.target_entropy).detach()).mean()
 
-                        # Compute targets
-                        next_actions = self.target_network(
-                            next_state_img_tensor,
-                            next_state_float_tensor,
-                            deterministic=False,
-                            with_logprob=True
-                        )
-                        next_steer, next_gas, next_brake, next_log_prob = next_actions
+                self.alpha_optimizer.zero_grad()
+                loss_alpha.backward()
+                self.alpha_optimizer.step()
 
-                        target_q1, target_q2 = self.target_network.q_values(
-                            next_state_img_tensor,
-                            next_state_float_tensor,
-                            next_steer,
-                            next_gas,
-                            next_brake
-                        )
+                q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor)
 
-                        alpha = self.log_alpha.exp()
-                        min_target_q = torch.min(target_q1, target_q2)
-                        target_value = min_target_q - alpha * next_log_prob.view(-1, 1)
-                        q_target = rewards.view(-1, 1) + gammas.view(-1, 1) * target_value
+                with torch.no_grad():
+                    next_policy_action, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor)
+                    q1_target, q2_target = self.target_network.q_values(state_img_tensor, state_float_tensor, next_policy_action)
+                    q_target = torch.min(q1_target, q2_target)
+                    backup = rewards + gamma * (1 - done) * (q_target - alpha_t * next_policy_logprob)
 
-                        # Compute critic loss
-                        critic_loss = F.mse_loss(current_q1, q_target) + F.mse_loss(current_q2, q_target)
+                loss_q1 = ((q1 - backup) ** 2).mean()
+                loss_q2 = ((q2 - backup) ** 2).mean()
+                q_loss = (loss_q1 + loss_q2) / 2
 
-                        # Update critic
-                        self.scaler.scale(critic_loss).backward()
-                        self.scaler.unscale_(self.q_optimizer)
-                        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                            [p for name, p in self.online_network.named_parameters()
-                             if any(x in name for x in ['q1_net', 'q2_net'])],
-                            float('inf')
-                        ).item()
-                        self.scaler.step(self.q_optimizer)
-                        self.scaler.update()
+                self.q_optimizer.zero_grad()
+                q_loss.backward()
+                self.q_optimizer.step()
 
-                # === Policy Update ===
-                if do_learn:
-                    self.policy_optimizer.zero_grad(set_to_none=True)
+                self.online_network.q1_net.requires_grad_(False)
+                self.online_network.q2_net.requires_grad_(False)
 
-                    pi_steer, pi_gas, pi_brake, log_prob = self.online_network(
-                        state_img_tensor,
-                        state_float_tensor,
-                        deterministic=False,
-                        with_logprob=True
-                    )
+                q1_policy, q2_policy = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
+                q_policy = torch.min(q1_policy, q2_policy)
 
-                    q1_pi, q2_pi = self.online_network.q_values(
-                        state_img_tensor,
-                        state_float_tensor,
-                        pi_steer,
-                        pi_gas,
-                        pi_brake
-                    )
+                # Entropy-regularized policy loss
+                policy_loss = (alpha_t * policy_logprob - q_policy).mean()
 
-                    min_q_pi = torch.min(q1_pi, q2_pi)
-                    alpha = self.log_alpha.exp()
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
 
-                    # Compute policy loss
-                    policy_loss = (alpha * log_prob - min_q_pi).mean()
+                # Unfreeze Q-networks so you can optimize it at next DDPG step.
+                self.online_network.q1_net.requires_grad_(True)
+                self.online_network.q2_net.requires_grad_(True)
 
-                    # Update policy
-                    self.scaler.scale(policy_loss).backward()
-                    self.scaler.unscale_(self.policy_optimizer)
-                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for name, p in self.online_network.named_parameters()
-                         if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
-                        float('inf')
-                    ).item()
-                    self.scaler.step(self.policy_optimizer)
-                    self.scaler.update()
+                with torch.no_grad():
+                    for policy, policy_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
+                        # NB: We use an in-place operations "mul_", "add_" to update target
+                        # params, as opposed to "mul" and "add", which would make new tensors.
+                        policy_targ.data.mul_(config_copy.polyak)
+                        policy_targ.data.add_((1 - config_copy.polyak) * policy.data)
 
-                    # === Alpha Update ===
-                    self.alpha_optimizer.zero_grad(set_to_none=True)
-                    alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-                    self.scaler.scale(alpha_loss).backward()
-                    self.scaler.unscale_(self.alpha_optimizer)
-                    self.scaler.step(self.alpha_optimizer)
-                    self.scaler.update()
-
-                    # === Target Network Update ===
-                    with torch.no_grad():
-                        for target_param, online_param in zip(
-                                self.target_network.parameters(),
-                                self.online_network.parameters()
-                        ):
-                            target_param.data.copy_(
-                                0.995 * target_param.data + 0.005 * online_param.data
-                            )
-
-                # Return values even when not learning
-                return (
-                    float(critic_loss + policy_loss + alpha_loss),
-                    float(critic_loss),
-                    float(policy_loss),
-                    float(alpha_loss),
-                    float(-log_prob.mean()),
-                    max(critic_grad_norm, policy_grad_norm)
-                )
+            #TODO: Return correct losses
 
         except Exception as e:
             print(f"Unexpected error in train_on_batch: {str(e)}")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
 
 class Inferer:
