@@ -470,7 +470,7 @@ def learner_process_fn(
             )
 
         # ===============================================
-        #   FILL BUFFER WITH (S, A, R, S') transitions
+        #   FILL BUFFER WITH (S, A, R, S', d) transitions
         # ===============================================
         if fill_buffer:
             (
@@ -482,6 +482,7 @@ def learner_process_fn(
                 buffer,
                 buffer_test,
                 rollout_results,
+                end_race_stats,
                 config_copy.n_steps,
                 gamma,
                 config_copy.discard_non_greedy_actions_in_nsteps,

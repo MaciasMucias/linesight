@@ -20,6 +20,7 @@ class Experience:
     n_steps                                     How many steps were taken between "state" and "next state". Not all transitions contain the same value, as this may depend on exploration policy. Note that in buffer_collate_function, a transition may be reinterpreted as terminal with a lower n_steps, depending on the random horizon that was sampled.
     gammas                                      a numpy array of shape (config.n_steps, ) containing the gamma value if steps = 0, 1, 2, etc...
     rewards                                     a numpy array of shape (config.n_steps, ) containing the reward value if steps = 0, 1, 2, etc...
+    done                                        was this a terminal state
 
     The structure of these transitions is unusual. It comes from our "mini-race" logic which will be explained somewhere else. I don't know where yet.
     This is how we are able to define Q-values as "the sum of expected rewards obtained during the next 7 seconds", and how we can optimise with gamma = 1.
@@ -37,6 +38,7 @@ class Experience:
         "next_state_potential",
         "gammas",
         "terminal_actions",
+        "done"
     )
 
     def __init__(
@@ -52,6 +54,7 @@ class Experience:
         next_state_potential: float,
         gammas: npt.NDArray,
         terminal_actions: int,
+        done: bool,
     ):
         self.state_img = state_img
         self.state_float = state_float
@@ -64,3 +67,5 @@ class Experience:
         self.next_state_potential = next_state_potential
         self.gammas = gammas
         self.terminal_actions = terminal_actions
+        self.done = done
+

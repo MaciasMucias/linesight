@@ -366,7 +366,7 @@ class Trainer:
                 # Get batch
                 batch, batch_info = buffer.sample(self.batch_size, return_info=True)
                 (state_img_tensor, state_float_tensor, actions, rewards,
-                 next_state_img_tensor, next_state_float_tensor, gammas) = batch
+                 next_state_img_tensor, next_state_float_tensor, gammas, done) = batch
 
                 # === Critic Update ===
                 if do_learn:
@@ -382,28 +382,27 @@ class Trainer:
                             actions[:, 2].unsqueeze(-1)
                         )
 
-                        with torch.no_grad():
-                            # Compute targets
-                            next_actions = self.target_network(
-                                next_state_img_tensor,
-                                next_state_float_tensor,
-                                deterministic=False,
-                                with_logprob=True
-                            )
-                            next_steer, next_gas, next_brake, next_log_prob = next_actions
+                        # Compute targets
+                        next_actions = self.target_network(
+                            next_state_img_tensor,
+                            next_state_float_tensor,
+                            deterministic=False,
+                            with_logprob=True
+                        )
+                        next_steer, next_gas, next_brake, next_log_prob = next_actions
 
-                            target_q1, target_q2 = self.target_network.q_values(
-                                next_state_img_tensor,
-                                next_state_float_tensor,
-                                next_steer,
-                                next_gas,
-                                next_brake
-                            )
+                        target_q1, target_q2 = self.target_network.q_values(
+                            next_state_img_tensor,
+                            next_state_float_tensor,
+                            next_steer,
+                            next_gas,
+                            next_brake
+                        )
 
-                            alpha = self.log_alpha.exp()
-                            min_target_q = torch.min(target_q1, target_q2)
-                            target_value = min_target_q - alpha * next_log_prob.view(-1, 1)
-                            q_target = rewards.view(-1, 1) + gammas.view(-1, 1) * target_value
+                        alpha = self.log_alpha.exp()
+                        min_target_q = torch.min(target_q1, target_q2)
+                        target_value = min_target_q - alpha * next_log_prob.view(-1, 1)
+                        q_target = rewards.view(-1, 1) + gammas.view(-1, 1) * target_value
 
                         # Compute critic loss
                         critic_loss = F.mse_loss(current_q1, q_target) + F.mse_loss(current_q2, q_target)
@@ -423,39 +422,37 @@ class Trainer:
                 if do_learn:
                     self.policy_optimizer.zero_grad(set_to_none=True)
 
-                    with torch.set_grad_enabled(True):
-                        # Fresh forward pass for policy
-                        pi_steer, pi_gas, pi_brake, log_prob = self.online_network(
-                            state_img_tensor,
-                            state_float_tensor,
-                            deterministic=False,
-                            with_logprob=True
-                        )
+                    pi_steer, pi_gas, pi_brake, log_prob = self.online_network(
+                        state_img_tensor,
+                        state_float_tensor,
+                        deterministic=False,
+                        with_logprob=True
+                    )
 
-                        q1_pi, q2_pi = self.online_network.q_values(
-                            state_img_tensor,
-                            state_float_tensor,
-                            pi_steer,
-                            pi_gas,
-                            pi_brake
-                        )
+                    q1_pi, q2_pi = self.online_network.q_values(
+                        state_img_tensor,
+                        state_float_tensor,
+                        pi_steer,
+                        pi_gas,
+                        pi_brake
+                    )
 
-                        min_q_pi = torch.min(q1_pi, q2_pi)
-                        alpha = self.log_alpha.exp()
+                    min_q_pi = torch.min(q1_pi, q2_pi)
+                    alpha = self.log_alpha.exp()
 
-                        # Compute policy loss
-                        policy_loss = (alpha * log_prob - min_q_pi).mean()
+                    # Compute policy loss
+                    policy_loss = (alpha * log_prob - min_q_pi).mean()
 
-                        # Update policy
-                        self.scaler.scale(policy_loss).backward()
-                        self.scaler.unscale_(self.policy_optimizer)
-                        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
-                            [p for name, p in self.online_network.named_parameters()
-                             if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
-                            float('inf')
-                        ).item()
-                        self.scaler.step(self.policy_optimizer)
-                        self.scaler.update()
+                    # Update policy
+                    self.scaler.scale(policy_loss).backward()
+                    self.scaler.unscale_(self.policy_optimizer)
+                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [p for name, p in self.online_network.named_parameters()
+                         if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+                        float('inf')
+                    ).item()
+                    self.scaler.step(self.policy_optimizer)
+                    self.scaler.update()
 
                     # === Alpha Update ===
                     self.alpha_optimizer.zero_grad(set_to_none=True)

@@ -461,7 +461,7 @@ class GameInstanceManager:
                     state_car_angular_velocity_in_car_reference_system = sim_state_orientation.dot(sim_state_angular_speed)
 
                     previous_actions = [
-                        rollout_results["actions"][k] if k >= 0 else [0., 1, 1]
+                        rollout_results["actions"][k] if k >= 0 else [0., 1, 0]
                         for k in range(
                             len(rollout_results["actions"]) - config_copy.n_prev_actions_in_inputs, len(rollout_results["actions"])
                         )

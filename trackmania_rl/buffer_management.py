@@ -35,6 +35,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
     buffer: ReplayBuffer,
     buffer_test: ReplayBuffer,
     rollout_results: dict,
+    end_race_stats: dict,
     n_steps_max: int,
     gamma: float,
     discard_non_greedy_actions_in_nsteps: bool,
@@ -67,33 +68,33 @@ def fill_buffer_from_rollout_with_n_steps_rule(
             rollout_results["meters_advanced_along_centerline"][i] - rollout_results["meters_advanced_along_centerline"][i - 1]
         ) * config_copy.reward_per_m_advanced_along_centerline
         if i < n_frames - 1:
-            if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][58] > 0:
+            if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][58-config_copy.n_prev_actions_in_inputs] > 0:
                 # car has velocity *forward*
                 reward_into[i] += config_copy.final_speed_reward_per_m_per_s * (
-                    np.linalg.norm(rollout_results["state_float"][i][56:59]) - np.linalg.norm(rollout_results["state_float"][i - 1][56:59])
+                    np.linalg.norm(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs:59-config_copy.n_prev_actions_in_inputs]) - np.linalg.norm(rollout_results["state_float"][i - 1][56-config_copy.n_prev_actions_in_inputs:59-config_copy.n_prev_actions_in_inputs])
                 )
-            if engineered_speedslide_reward != 0 and np.all(rollout_results["state_float"][i][25:29]):
+            if engineered_speedslide_reward != 0 and np.all(rollout_results["state_float"][i][25-config_copy.n_prev_actions_in_inputs:29-config_copy.n_prev_actions_in_inputs]):
                 # all wheels touch the ground
                 reward_into[i] += engineered_speedslide_reward * max(
                     0.0,
-                    1 - abs(speedslide_quality_tarmac(rollout_results["state_float"][i][56], rollout_results["state_float"][i][58]) - 1),
+                    1 - abs(speedslide_quality_tarmac(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs], rollout_results["state_float"][i][58-config_copy.n_prev_actions_in_inputs]) - 1),
                 )  # TODO : indices 25:29, 56 and 58 are hardcoded, this is bad....
 
             # lateral speed is higher than 2 meters per second
             reward_into[i] += (
-                engineered_neoslide_reward if abs(rollout_results["state_float"][i][56]) >= 2.0 else 0
+                engineered_neoslide_reward if abs(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs]) >= 2.0 else 0
             )  # TODO : 56 is hardcoded, this is bad....
             # kamikaze reward
             if (
                 engineered_kamikaze_reward != 0
                 and rollout_results["actions"][i] <= 2
-                or np.sum(rollout_results["state_float"][i][25:29]) <= 1
+                or np.sum(rollout_results["state_float"][i][25-config_copy.n_prev_actions_in_inputs:29-config_copy.n_prev_actions_in_inputs]) <= 1
             ):
                 reward_into[i] += engineered_kamikaze_reward
             if engineered_close_to_vcp_reward != 0:
                 reward_into[i] += engineered_close_to_vcp_reward * max(
                     config_copy.engineered_reward_min_dist_to_cur_vcp,
-                    min(config_copy.engineered_reward_max_dist_to_cur_vcp, np.linalg.norm(rollout_results["state_float"][i][62:65])),
+                    min(config_copy.engineered_reward_max_dist_to_cur_vcp, np.linalg.norm(rollout_results["state_float"][i][62-config_copy.n_prev_actions_in_inputs:65-config_copy.n_prev_actions_in_inputs])),
                 )
     for i in range(n_frames - 1):  # Loop over all frames that were generated
         # Switch memory buffer sometimes
@@ -144,6 +145,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
                 next_state_potential,
                 gammas,
                 terminal_actions,
+                end_race_stats["race_finished"][i]
             )
         )
     number_memories_added_train += len(Experiences_For_Buffer)

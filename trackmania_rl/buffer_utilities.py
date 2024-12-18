@@ -61,6 +61,7 @@ def buffer_collate_function(batch):
         gammas,
         terminal_actions,
         n_steps,
+        done,
     ) = tuple(
         map(
             lambda attr_name: fast_collate_cpu(batch, attr_name),
@@ -76,6 +77,7 @@ def buffer_collate_function(batch):
                 "gammas",
                 "terminal_actions",
                 "n_steps",
+                "done",
             ],
         )
     )
@@ -168,6 +170,7 @@ def buffer_collate_function(batch):
         next_state_img,
         next_state_float,
         gammas,
+        done,
     )
 
 
