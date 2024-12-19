@@ -54,7 +54,7 @@ class Experience:
         next_state_potential: float,
         gammas: npt.NDArray,
         terminal_actions: int,
-        done: bool,
+        done: int,
     ):
         self.state_img = state_img
         self.state_float = state_float

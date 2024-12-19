@@ -49,6 +49,43 @@ def learner_process_fn(
     SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(
         {
             layout_version: {
+                "single_zone_reached": [
+                    "Multiline",
+                    [
+                        "^single_zone_reached",
+                    ],
+                ],
+                "critic_evaluation": [
+                    "Multiline",
+                    ["^Q_value"],
+                ],
+                "critic_loss": [
+                    "Multiline",
+                    [
+                        "^critic_loss$",
+                        "^critic_loss_test$",
+                    ],
+                ],
+                "policy_loss": [
+                    "Multiline", [
+                        "^policy_loss$",
+                        "^policy_loss_test$"
+                    ]
+                ],
+                "entropy_loss": [
+                    "Multiline",
+                    [
+                        "^alpha_loss$",
+                        "^alpha_loss_test$",
+                    ],
+                ],
+                "entropy": [
+                    "Multiline",
+                    [
+                        "^alpha_t$",
+                        "^alpha_t_test$",
+                    ]
+                ],
                 "eval_race_time_robust": [
                     "Multiline",
                     [
@@ -60,47 +97,7 @@ def learner_process_fn(
                     [
                         "explo_race_time_finished",
                     ],
-                ],
-                "loss": ["Multiline", ["loss$", "loss_test$"]],
-                "policy_metrics": [
-                    "Multiline",
-                    [
-                        "policy_loss",
-                        "policy_loss_test",
-                        "entropy",
-                    ],
-                ],
-                "critic_metrics": [
-                    "Multiline",
-                    [
-                        "critic_loss$",
-                        "critic_loss_test$",
-                    ],
-                ],
-                "temperature": [
-                    "Multiline",
-                    [
-                        "alpha_loss",
-                        "alpha_value",
-                    ],
-                ],
-                "avg_Q": [
-                    "Multiline",
-                    ["avg_Q"],
-                ],
-                "single_zone_reached": [
-                    "Multiline",
-                    [
-                        "single_zone_reached",
-                    ],
-                ],
-                "grad_norm_history": [
-                    "Multiline",
-                    [
-                        "grad_norm_history_d9",
-                        "grad_norm_history_d98",
-                    ],
-                ],
+                ]
             },
         }
     )
@@ -165,12 +162,15 @@ def learner_process_fn(
         config_copy.policy_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
     alpha_lr = utilities.from_exponential_schedule(
-        config_copy.alpha_lr_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
+        config_copy.alpha_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
 
-    log_alpha = torch.zeros(1 * config_copy.alpha_initial_value, requires_grad=True, device="cuda")
-    q_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits'])],
+    log_alpha = torch.nn.Parameter(
+        torch.ones(1, device="cuda") * config_copy.alpha_initial_value
+    )
+
+    critic_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
+        if any(x in name for x in ['policy_mean', 'policy_log_std'])],
                                         lr=critic_lr,
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
@@ -197,7 +197,7 @@ def learner_process_fn(
     # noinspection PyBroadException
     try:
         policy_optimizer.load_state_dict(torch.load(f=save_dir / "policy_optimizer.torch", weights_only=False))
-        q_optimizer.load_state_dict(torch.load(f=save_dir / "q_optimizer.torch", weights_only=False))
+        critic_optimizer.load_state_dict(torch.load(f=save_dir / "critic_optimizer.torch", weights_only=False))
         alpha_optimizer.load_state_dict(torch.load(f=save_dir / "alpha_optimizer.torch", weights_only=False))
         scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
         print(" =========================     Optimizers loaded !     ================================")
@@ -210,19 +210,15 @@ def learner_process_fn(
     )
     tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + tensorboard_suffix)))
 
-    loss_history = []
     critic_loss_history = []
     policy_loss_history = []
     alpha_loss_history = []
     entropy_history = []
-    loss_test_history = []
     critic_loss_test_history = []
     policy_loss_test_history = []
     alpha_loss_test_history = []
     entropy_test_history = []
     train_on_batch_duration_history = []
-    grad_norm_history = []
-    layer_grad_norm_history = defaultdict(list)
 
     # ========================================================
     # Make the trainer
@@ -231,7 +227,7 @@ def learner_process_fn(
         online_network=online_network,
         target_network=target_network,
         policy_optimizer=policy_optimizer,
-        q_optimizer=q_optimizer,
+        critic_optimizer=critic_optimizer,
         alpha_optimizer=alpha_optimizer,
         scaler=scaler,
         batch_size=config_copy.batch_size,
@@ -292,34 +288,25 @@ def learner_process_fn(
         #   VERY BASIC TRAINING ANNEALING
         # ===============================================
 
-        # LR and weight_decay calculation
-        learning_rate = utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"])
-        weight_decay = config_copy.weight_decay_lr_ratio * learning_rate
-        engineered_speedslide_reward = utilities.from_linear_schedule(
-            config_copy.engineered_speedslide_reward_schedule,
-            accumulated_stats["cumul_number_memories_generated"],
-        )
-        engineered_neoslide_reward = utilities.from_linear_schedule(
-            config_copy.engineered_neoslide_reward_schedule,
-            accumulated_stats["cumul_number_memories_generated"],
-        )
-        engineered_kamikaze_reward = utilities.from_linear_schedule(
-            config_copy.engineered_kamikaze_reward_schedule, accumulated_stats["cumul_number_memories_generated"]
-        )
-        engineered_close_to_vcp_reward = utilities.from_linear_schedule(
-            config_copy.engineered_close_to_vcp_reward_schedule, accumulated_stats["cumul_number_memories_generated"]
-        )
         gamma = utilities.from_linear_schedule(config_copy.gamma_schedule, accumulated_stats["cumul_number_memories_generated"])
 
         # ===============================================
         #   RELOAD
         # ===============================================
 
-        for optimizer in [policy_optimizer, q_optimizer, alpha_optimizer]:
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = learning_rate
-                param_group["epsilon"] = config_copy.adam_epsilon
-                param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+
+        for param_group in policy_optimizer.param_groups:
+            param_group["lr"] = policy_lr
+            param_group["epsilon"] = config_copy.adam_epsilon
+            param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+        for param_group in critic_optimizer.param_groups:
+            param_group["lr"] = critic_lr
+            param_group["epsilon"] = config_copy.adam_epsilon
+            param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+        for param_group in alpha_optimizer.param_groups:
+            param_group["lr"] = alpha_lr
+            param_group["epsilon"] = config_copy.adam_epsilon
+            param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
 
         if isinstance(buffer._sampler, PrioritizedSampler):
             buffer._sampler._alpha = config_copy.prio_alpha
@@ -329,8 +316,8 @@ def learner_process_fn(
         if config_copy.plot_race_time_left_curves and not is_explo and (loop_number // 5) % 17 == 0:
             race_time_left_curves(rollout_results, inferer, save_dir, map_name)
             tau_curves(rollout_results, inferer, save_dir, map_name)
-            distribution_curves(buffer, save_dir, online_network, target_network)
-            loss_distribution(buffer, save_dir, online_network, target_network)
+            # distribution_curves(buffer, save_dir, online_network, target_network)
+            # loss_distribution(buffer, save_dir, online_network, target_network)
             # patrick_curves(rollout_results, trainer, save_dir, map_name)
 
         accumulated_stats["cumul_number_frames_played"] += len(rollout_results["frames"])
@@ -363,7 +350,7 @@ def learner_process_fn(
         print("Race time ratio  ", race_stats_to_write[f"race_time_ratio_{map_name}"])
 
         if not is_explo:
-            race_stats_to_write[f"avg_Q_{map_status}_{map_name}"] = np.mean(rollout_results["q_values"])
+            race_stats_to_write[f"Q_value_{map_status}_{map_name}"] = np.mean(rollout_results["q_value"])
 
         if end_race_stats["race_finished"]:
             race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
@@ -440,7 +427,7 @@ def learner_process_fn(
                     online_network,
                     target_network,
                     policy_optimizer,
-                    q_optimizer,
+                    critic_optimizer,
                     alpha_optimizer,
                     scaler,
                 )
@@ -470,12 +457,7 @@ def learner_process_fn(
                 rollout_results,
                 end_race_stats,
                 config_copy.n_steps,
-                gamma,
-                config_copy.discard_non_greedy_actions_in_nsteps,
-                engineered_speedslide_reward,
-                engineered_neoslide_reward,
-                engineered_kamikaze_reward,
-                engineered_close_to_vcp_reward,
+                gamma
             )
 
             accumulated_stats["cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
@@ -562,7 +544,7 @@ def learner_process_fn(
             ):
                 if (random.random() < config_copy.buffer_test_ratio and len(buffer_test) > 0) or len(buffer) == 0:
                     test_start_time = time.perf_counter()
-                    critic_loss, policy_loss, alpha_loss, entropy, _ = trainer.train_on_batch(
+                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(
                         buffer_test, do_learn=False)
                     time_testing_since_last_tensorboard_write += time.perf_counter() - test_start_time
 
@@ -572,11 +554,11 @@ def learner_process_fn(
                     alpha_loss_test_history.append(alpha_loss)
                     entropy_test_history.append(entropy)
 
-                    print(f"BT   critic={critic_loss:<8.2e} policy={policy_loss:<8.2e} alpha={alpha_loss:<8.2e}")
+                    print(f"BT {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}")
                 else:
                     train_start_time = time.perf_counter()
                     # Unpack all losses from the trainer
-                    critic_loss, policy_loss, alpha_loss, entropy, grad_norm = trainer.train_on_batch(
+                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(
                         buffer, do_learn=True)
                     train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
                     time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]
@@ -588,43 +570,25 @@ def learner_process_fn(
                     )
 
                     # Store all metrics in history
-                    loss_history.append(total_loss)
                     critic_loss_history.append(critic_loss)
                     policy_loss_history.append(policy_loss)
                     alpha_loss_history.append(alpha_loss)
                     entropy_history.append(entropy)
 
-                    if not math.isinf(grad_norm):
-                        grad_norm_history.append(grad_norm)
-
                     accumulated_stats["cumul_number_batches_done"] += 1
-                    print(f"B    {total_loss=:<8.2e} {grad_norm=:<8.2e} {train_on_batch_duration_history[-1] * 1000:<8.1f}")
+                    print(f"B    {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}, {train_on_batch_duration_history[-1] * 1000:<8.1f}")
 
-                    # TODO: bring this back
-                    # utilities.custom_weight_decay(online_network, 1 - weight_decay)
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
                             uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
-
-                    # ===============================================
-                    #   UPDATE TARGET NETWORK
-                    # ===============================================
-                    if (
-                        accumulated_stats["cumul_number_single_memories_used"]
-                        >= accumulated_stats["cumul_number_single_memories_used_next_target_network_update"]
-                    ):
-                        accumulated_stats["cumul_number_target_network_updates"] += 1
-                        accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] += (
-                            config_copy.number_memories_trained_on_between_target_network_updates
-                        )
-                        utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
             sys.stdout.flush()
 
         # ===============================================
-        #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES
+        #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES # 1 minute
         # ===============================================
-        save_frequency_s = 5 * 60
+        save_frequency_s = 1 * 60 # 5 * 60
         if time.perf_counter() - time_last_save >= save_frequency_s:
+            print("Writing to TensorBoard")
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
             waited_percentage = time_waited_for_workers_since_last_tensorboard_write / time_since_last_save
@@ -646,10 +610,8 @@ def learner_process_fn(
                 "gamma": gamma,
                 "n_steps": config_copy.n_steps,
                 "epsilon": utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value),
-                "learning_rate": learning_rate,
-                "weight_decay": weight_decay,
                 "policy_lr": policy_optimizer.param_groups[0]["lr"],
-                "q_lr": q_optimizer.param_groups[0]["lr"],
+                "critic_lr": critic_optimizer.param_groups[0]["lr"],
                 "alpha_lr": alpha_optimizer.param_groups[0]["lr"],
                 "alpha_value": torch.exp(log_alpha).item(),
                 "discard_non_greedy_actions_in_nsteps": config_copy.discard_non_greedy_actions_in_nsteps,
@@ -660,75 +622,33 @@ def learner_process_fn(
                 "learner_percentage_testing": tested_percentage,
                 "transitions_learned_per_second": transitions_learned_per_second,
             }
-            if len(loss_history) > 0 and len(loss_test_history) > 0:
+            print(len(critic_loss_history), len(critic_loss_test_history))
+            if len(critic_loss_history) > 0 and len(critic_loss_test_history) > 0:
+
                 step_stats.update({
-                    "loss": np.mean(loss_history),
-                    "loss_test": np.mean(loss_test_history),
                     "critic_loss": np.mean(critic_loss_history),
                     "critic_loss_test": np.mean(critic_loss_test_history),
                     "policy_loss": np.mean(policy_loss_history),
                     "policy_loss_test": np.mean(policy_loss_test_history),
                     "alpha_loss": np.mean(alpha_loss_history),
                     "alpha_loss_test": np.mean(alpha_loss_test_history),
-                    "entropy": np.mean(entropy_history),
-                    "entropy_test": np.mean(entropy_test_history),
+                    "alpha_t": np.mean(entropy_history),
+                    "alpha_t_test": np.mean(entropy_test_history),
                     "train_on_batch_duration": np.median(train_on_batch_duration_history),
-                    "grad_norm_history_q1": np.quantile(grad_norm_history, 0.25),
-                    "grad_norm_history_median": np.quantile(grad_norm_history, 0.5),
-                    "grad_norm_history_q3": np.quantile(grad_norm_history, 0.75),
-                    "grad_norm_history_d9": np.quantile(grad_norm_history, 0.9),
-                    "grad_norm_history_d98": np.quantile(grad_norm_history, 0.98),
-                    "grad_norm_history_max": np.max(grad_norm_history),
                 })
 
             if online_network.training:
                 online_network.eval()
 
-            # Sample a state for statistics
-            sample_state_img = torch.as_tensor(rollout_results["frames"][0]).unsqueeze(0).to("cuda")
-            sample_state_float = torch.as_tensor(rollout_results["state_float"][0]).unsqueeze(0).to("cuda")
-
-            # Use no_grad since we're just collecting statistics
-            with torch.no_grad():
-                # Get policy outputs with deterministic=True to get the mean actions
-                steer_mean, gas_mean, brake_mean, _ = online_network(
-                    sample_state_img,
-                    sample_state_float,
-                    deterministic=True,
-                    with_logprob=False
-                )
-
-                # Get non-deterministic actions to see the exploration behavior
-                steer, gas, brake, _ = online_network(
-                    sample_state_img,
-                    sample_state_float,
-                    deterministic=False,
-                    with_logprob=False
-                )
-
-            # Add policy statistics to step_stats
-            step_stats.update({
-                "action_mean_steer": steer_mean[0].item(),
-                "action_mean_gas": gas_mean[0].item(),
-                "action_mean_brake": brake_mean[0].item(),
-                "action_std_steer": abs(steer - steer_mean).mean().item(),
-                "action_std_gas": abs(gas - gas_mean).mean().item(),
-                "action_std_brake": abs(brake - brake_mean).mean().item()
-            })
-
-            loss_history = []
             critic_loss_history = []
             policy_loss_history = []
             alpha_loss_history = []
             entropy_history = []
-            loss_test_history = []
             critic_loss_test_history = []
             policy_loss_test_history = []
             alpha_loss_test_history = []
             entropy_test_history = []
             train_on_batch_duration_history = []
-            grad_norm_history = []
-            layer_grad_norm_history = defaultdict(list)
 
             # ===============================================
             #   WRITE TO TENSORBOARD
@@ -738,7 +658,7 @@ def learner_process_fn(
             # Basic network statistics
             for name, param in online_network.named_parameters():
                 # Categorize parameters by network type
-                if any(x in name for x in ['steer_mean', 'steer_log_std', 'up_logits', 'down_logits']):
+                if any(x in name for x in ['policy_mean', 'policy_logprob']):
                     prefix = "policy"
                 elif any(x in name for x in ['q1_net', 'q2_net']):
                     prefix = "q"
@@ -752,40 +672,16 @@ def learner_process_fn(
                     walltime=walltime_tb,
                 )
 
-            # SAC-specific metrics
-            tensorboard_writer.add_scalar(
-                tag="policy/loss",
-                scalar_value=np.mean(policy_loss_history) if policy_loss_history else 0,
-                global_step=accumulated_stats["cumul_number_frames_played"],
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag="critic/q1_loss",
-                scalar_value=np.mean(critic_loss_history) if critic_loss_history else 0,
-                global_step=accumulated_stats["cumul_number_frames_played"],
-                walltime=walltime_tb,
-            )
             tensorboard_writer.add_scalar(
                 tag="alpha/value",
                 scalar_value=torch.exp(trainer.log_alpha).item(),
                 global_step=accumulated_stats["cumul_number_frames_played"],
                 walltime=walltime_tb,
             )
-            tensorboard_writer.add_scalar(
-                tag="alpha/loss",
-                scalar_value=np.mean(alpha_loss_history) if alpha_loss_history else 0,
-                global_step=accumulated_stats["cumul_number_frames_played"],
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag="policy/entropy",
-                scalar_value=np.mean(entropy_history) if entropy_history else 0,
-                global_step=accumulated_stats["cumul_number_frames_played"],
-                walltime=walltime_tb,
-            )
 
             # Write all other statistics
             for k, v in step_stats.items():
+                print(k)
                 tensorboard_writer.add_scalar(
                     tag=k,
                     scalar_value=v,
@@ -841,5 +737,5 @@ def learner_process_fn(
             #   SAVE
             # ===============================================
             print("Saving")
-            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, q_optimizer, alpha_optimizer, scaler)
+            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, critic_optimizer, alpha_optimizer, scaler)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

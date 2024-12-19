@@ -115,7 +115,7 @@ def buffer_collate_function(batch):
     rewards += np.where(terminal, 0, gammas * next_state_potential)
     rewards -= state_potential
 
-    state_img, state_float, action, rewards, next_state_img, next_state_float, gammas = tuple(
+    state_img, state_float, action, rewards, next_state_img, next_state_float, gammas, done = tuple(
         map(
             lambda batch, attr_name: send_to_gpu(batch, attr_name),
             [
@@ -126,6 +126,7 @@ def buffer_collate_function(batch):
                 next_state_img,
                 next_state_float,
                 gammas,
+                done,
             ],
             [
                 "state_img",
@@ -135,6 +136,7 @@ def buffer_collate_function(batch):
                 "next_state_img",
                 "next_state_float",
                 "gammas",
+                "done",
             ],
         )
     )

@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run"
+run_name = "sac_run_v2"
 running_speed = 10
 
 tm_engine_step_per_action = 5
@@ -63,22 +63,9 @@ epsilon_boltzmann_schedule = [
     (0, 0.15),
     (3_000_000 * global_schedule_speed, 0.03),
 ]
-tau_epsilon_boltzmann = 0.01
+
 discard_non_greedy_actions_in_nsteps = True
 buffer_test_ratio = 0.05
-
-engineered_speedslide_reward_schedule = [
-    (0, 0),
-]
-engineered_neoslide_reward_schedule = [
-    (0, 0),
-]
-engineered_kamikaze_reward_schedule = [
-    (0, 0),
-]
-engineered_close_to_vcp_reward_schedule = [
-    (0, 0),
-]
 
 n_steps = 3
 constant_reward_per_ms = -6 / 5000
@@ -173,7 +160,7 @@ n_pixels_to_crop_on_each_side = 2
 
 max_rollout_queue_size = 1
 
-use_jit = True
+use_jit = False
 
 # gpu_collectors_count is the number of Trackmania instances that will be launched in parallel.
 # It is recommended that users adjust this number depending on the performance of their machine.

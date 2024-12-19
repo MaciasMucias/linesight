@@ -37,12 +37,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
     rollout_results: dict,
     end_race_stats: dict,
     n_steps_max: int,
-    gamma: float,
-    discard_non_greedy_actions_in_nsteps: bool,
-    engineered_speedslide_reward: float,
-    engineered_neoslide_reward: float,
-    engineered_kamikaze_reward: float,
-    engineered_close_to_vcp_reward: float,
+    gamma: float
 ):
     assert len(rollout_results["frames"]) == len(rollout_results["current_zone_idx"])
     n_frames = len(rollout_results["frames"])
@@ -68,46 +63,21 @@ def fill_buffer_from_rollout_with_n_steps_rule(
             rollout_results["meters_advanced_along_centerline"][i] - rollout_results["meters_advanced_along_centerline"][i - 1]
         ) * config_copy.reward_per_m_advanced_along_centerline
         if i < n_frames - 1:
-            if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][58-config_copy.n_prev_actions_in_inputs] > 0:
+            speed_vector_start = 40
+            speed_vector_end = speed_vector_start + 2 # 3d, 1 already at start
+            if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][speed_vector_end] > 0:
                 # car has velocity *forward*
                 reward_into[i] += config_copy.final_speed_reward_per_m_per_s * (
-                    np.linalg.norm(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs:59-config_copy.n_prev_actions_in_inputs]) - np.linalg.norm(rollout_results["state_float"][i - 1][56-config_copy.n_prev_actions_in_inputs:59-config_copy.n_prev_actions_in_inputs])
+                    np.linalg.norm(rollout_results["state_float"][i][speed_vector_start:speed_vector_end+1]) - np.linalg.norm(rollout_results["state_float"][i - 1][speed_vector_start:speed_vector_end+1])
                 )
-            if engineered_speedslide_reward != 0 and np.all(rollout_results["state_float"][i][25-config_copy.n_prev_actions_in_inputs:29-config_copy.n_prev_actions_in_inputs]):
-                # all wheels touch the ground
-                reward_into[i] += engineered_speedslide_reward * max(
-                    0.0,
-                    1 - abs(speedslide_quality_tarmac(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs], rollout_results["state_float"][i][58-config_copy.n_prev_actions_in_inputs]) - 1),
-                )  # TODO : indices 25:29, 56 and 58 are hardcoded, this is bad....
 
-            # lateral speed is higher than 2 meters per second
-            reward_into[i] += (
-                engineered_neoslide_reward if abs(rollout_results["state_float"][i][56-config_copy.n_prev_actions_in_inputs]) >= 2.0 else 0
-            )  # TODO : 56 is hardcoded, this is bad....
-            # kamikaze reward
-            if (
-                engineered_kamikaze_reward != 0
-                and rollout_results["actions"][i] <= 2
-                or np.sum(rollout_results["state_float"][i][25-config_copy.n_prev_actions_in_inputs:29-config_copy.n_prev_actions_in_inputs]) <= 1
-            ):
-                reward_into[i] += engineered_kamikaze_reward
-            if engineered_close_to_vcp_reward != 0:
-                reward_into[i] += engineered_close_to_vcp_reward * max(
-                    config_copy.engineered_reward_min_dist_to_cur_vcp,
-                    min(config_copy.engineered_reward_max_dist_to_cur_vcp, np.linalg.norm(rollout_results["state_float"][i][62-config_copy.n_prev_actions_in_inputs:65-config_copy.n_prev_actions_in_inputs])),
-                )
+
     for i in range(n_frames - 1):  # Loop over all frames that were generated
         # Switch memory buffer sometimes
         if random.random() < 0.1:
             list_to_fill = Experiences_For_Buffer_Test if random.random() < config_copy.buffer_test_ratio else Experiences_For_Buffer
 
         n_steps = min(n_steps_max, n_frames - 1 - i)
-        if discard_non_greedy_actions_in_nsteps:
-            try:
-                first_non_greedy = rollout_results["action_was_greedy"][i + 1 : i + n_steps].index(False) + 1
-                n_steps = min(n_steps, first_non_greedy)
-            except ValueError:
-                pass
 
         rewards = np.empty(n_steps_max).astype(np.float32)
         for j in range(n_steps):
@@ -119,7 +89,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
 
         # Get action that was played
         action = rollout_results["actions"][i]
-        terminal_actions = float((n_frames - 1) - i) if "race_time" in rollout_results else math.inf
+        terminal_actions = int((n_frames - 1) - i) if "race_time" in rollout_results else math.inf
         next_state_has_passed_finish = ((i + n_steps) == (n_frames - 1)) and ("race_time" in rollout_results)
 
         if not next_state_has_passed_finish:
@@ -145,7 +115,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
                 next_state_potential,
                 gammas,
                 terminal_actions,
-                end_race_stats["race_finished"][i]
+                int(terminal_actions==0),
             )
         )
     number_memories_added_train += len(Experiences_For_Buffer)

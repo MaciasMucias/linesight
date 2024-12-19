@@ -122,7 +122,7 @@ def collector_process_fn(
                     time.perf_counter() - time_since_last_queue_push)
 
         if len(rollout_results["frames"]) > 0:
-            _, _, q_value, _ = inferer.get_exploration_action(
+            action, q_value = inferer.get_exploration_action(
                 rollout_results["frames"][0],
                 rollout_results["state_float"][0]
             )
