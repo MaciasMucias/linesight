@@ -266,7 +266,6 @@ class Trainer:
             policy_optimizer: Optimizer,
             critic_optimizer: Optimizer,
             alpha_optimizer: Optimizer,
-            scaler: torch.amp.GradScaler,
             batch_size: int,
             log_alpha: torch.Tensor,
     ):
@@ -275,7 +274,6 @@ class Trainer:
         self.policy_optimizer = policy_optimizer
         self.q_optimizer = critic_optimizer
         self.alpha_optimizer = alpha_optimizer
-        self.scaler = scaler
         self.batch_size = batch_size
         self.log_alpha = log_alpha
         self.train_steps = 0
@@ -302,7 +300,7 @@ class Trainer:
 
             with torch.no_grad():
                 next_policy_action, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
-                q1_target, q2_target = self.target_network.q_values(state_img_tensor, state_float_tensor, next_policy_action)
+                q1_target, q2_target = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_action)
                 q_target = torch.min(q1_target, q2_target)
                 backup = rewards + gamma * (1 - done) * (q_target - alpha_t * next_policy_logprob)
 

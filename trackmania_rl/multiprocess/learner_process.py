@@ -229,7 +229,6 @@ def learner_process_fn(
         policy_optimizer=policy_optimizer,
         critic_optimizer=critic_optimizer,
         alpha_optimizer=alpha_optimizer,
-        scaler=scaler,
         batch_size=config_copy.batch_size,
         log_alpha=log_alpha,
     )
