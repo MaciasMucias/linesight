@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v2"
+run_name = "sac_run_v3"
 running_speed = 10
 
 tm_engine_step_per_action = 5
@@ -160,7 +160,7 @@ n_pixels_to_crop_on_each_side = 2
 
 max_rollout_queue_size = 1
 
-use_jit = False
+use_jit = True
 
 # gpu_collectors_count is the number of Trackmania instances that will be launched in parallel.
 # It is recommended that users adjust this number depending on the performance of their machine.
