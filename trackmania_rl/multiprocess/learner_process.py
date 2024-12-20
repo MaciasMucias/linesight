@@ -553,7 +553,7 @@ def learner_process_fn(
                     alpha_loss_test_history.append(alpha_loss)
                     entropy_test_history.append(entropy)
 
-                    print(f"BT {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}")
+                    print(f"BT   {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}")
                 else:
                     train_start_time = time.perf_counter()
                     # Unpack all losses from the trainer

@@ -1,4 +1,5 @@
 import copy
+import itertools
 import sys
 
 import torch
@@ -43,6 +44,10 @@ class Normal:
     def sample(self) -> torch.Tensor:
         return torch.normal(self.loc.expand(self._batch_shape), self.scale.expand(self._batch_shape))
 
+    def rsample(self) -> torch.Tensor:
+        epsilon = torch.randn_like(self.scale)
+        return self.loc + self.scale * epsilon
+
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
         var = (self.scale ** 2)
         log_scale = self.scale.log()
@@ -74,16 +79,16 @@ class SAC_Network(torch.nn.Module):
         img_head_channels = [1, 16, 32, 64, 32]
         self.img_head = torch.nn.Sequential(
             torch.nn.Conv2d(img_head_channels[0], img_head_channels[1], kernel_size=(4, 4), stride=2),
-            #torch.nn.BatchNorm2d(img_head_channels[1]),
+            torch.nn.BatchNorm2d(img_head_channels[1]),
             activation_function(inplace=True),
             torch.nn.Conv2d(img_head_channels[1], img_head_channels[2], kernel_size=(4, 4), stride=2),
-            #torch.nn.BatchNorm2d(img_head_channels[2]),
+            torch.nn.BatchNorm2d(img_head_channels[2]),
             activation_function(inplace=True),
             torch.nn.Conv2d(img_head_channels[2], img_head_channels[3], kernel_size=(3, 3), stride=2),
-            #torch.nn.BatchNorm2d(img_head_channels[3]),
+            torch.nn.BatchNorm2d(img_head_channels[3]),
             activation_function(inplace=True),
             torch.nn.Conv2d(img_head_channels[3], img_head_channels[4], kernel_size=(3, 3), stride=1),
-            #torch.nn.BatchNorm2d(img_head_channels[4]),
+            torch.nn.BatchNorm2d(img_head_channels[4]),
             activation_function(inplace=True),
             torch.nn.Flatten(),
         )
@@ -159,14 +164,14 @@ class SAC_Network(torch.nn.Module):
 
             # Special initialization for policy heads
         for module in [self.policy_mean, self.policy_log_std]:
-            torch.nn.init.uniform_(module.weight, -3e-3, 3e-3)
-            torch.nn.init.uniform_(module.bias, -3e-3, 3e-3)
+            torch.nn.init.uniform_(module.weight, -1e-3, 1e-3)
+            torch.nn.init.uniform_(module.bias, -1e-3, 1e-3)
 
             # Special initialization for final Q-network layers
         for q_net in [self.q1_net, self.q2_net]:
             final_layer = q_net[-1]
-            torch.nn.init.uniform_(final_layer.weight, -3e-3, 3e-3)
-            torch.nn.init.uniform_(final_layer.bias, -3e-3, 3e-3)
+            torch.nn.init.uniform_(final_layer.weight, -1e-3, 1e-3)
+            torch.nn.init.uniform_(final_layer.bias, -1e-3, 1e-3)
 
     def preprocess_inputs(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         state_img_tensor = img.to(device="cuda",
@@ -192,17 +197,24 @@ class SAC_Network(torch.nn.Module):
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor,
                 deterministic: bool, with_logprob: bool) -> tuple[Tensor, Tensor | None]:
         features = self.get_features(img, float_inputs)
-
         # Get steering distribution parameters
         mean = self.policy_mean(features)
-        mean = torch.clamp(mean, -3.0, 3.0)
-        log_std = torch.clamp(self.policy_log_std(features), self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = self.policy_log_std(features)
+        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
         std = torch.exp(log_std)
+
+        if torch.isnan(mean).any() or torch.isnan(std).any():
+            print(features)
+            print(mean)
+            print(log_std)
+            print(std)
+            raise ValueError("NaN detected in policy distribution parameters")
+
         policy_distribution = Normal(mean, std)
         if deterministic:
             policy_action = mean
         else:
-            policy_action = policy_distribution.sample()
+            policy_action = policy_distribution.rsample()
 
         if with_logprob:
             policy_logprob = policy_distribution.log_prob(policy_action).sum(dim=-1)
@@ -211,19 +223,15 @@ class SAC_Network(torch.nn.Module):
             policy_logprob = None
 
         policy_action = torch.tanh(policy_action)
-
-
         return policy_action, policy_logprob
 
     @torch.jit.export
-    def q_values(self, img: torch.Tensor, float_inputs: torch.Tensor, actions):
+    def q_values(self, img: torch.Tensor, float_inputs: torch.Tensor, actions: torch.Tensor):
         features = self.get_features(img, float_inputs)
-        # Create new tensors instead of inplace operations
-        sa = torch.cat([features.detach().clone(), actions], dim=-1)
-
+        # Create new tensor for concatenation instead of modifying in place
+        sa = torch.cat([features, actions], dim=-1)
         q1 = self.q1_net(sa)
         q2 = self.q2_net(sa)
-
         return q1, q2
 
     def to(self, *args, **kwargs):
@@ -281,7 +289,7 @@ def sac_loss(
         # Compute critic losses
         loss_q1 = ((q1 - backup) ** 2).mean()
         loss_q2 = ((q2 - backup) ** 2).mean()
-        critic_loss = (loss_q1 + loss_q2) / 2
+        critic_loss = (loss_q1 + loss_q2)/2
 
         # Compute policy Q-values
         q1_policy, q2_policy = online_network.q_values(state_img, state_float, policy_action)
@@ -313,15 +321,25 @@ class Trainer:
         self.log_alpha = log_alpha
         self.train_steps = 0
 
-    def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
-        target_entropy = -N_ACTIONS
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            # Get batch
-            batch, batch_info = buffer.sample(self.batch_size, return_info=True)
-            (state_img_tensor, state_float_tensor, actions, rewards,
-             next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
+        self.scaler = torch.amp.GradScaler('cuda')
+        self.max_grad_norm = 1.0
 
+    def check_nan(self, tensor: torch.Tensor, name: str):
+        if torch.isnan(tensor).any():
+            print(f"NaN detected in {name}")
+            raise ValueError(f"NaN in {name}")
+
+    def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
+        torch.autograd.set_detect_anomaly(True)
+        target_entropy = -N_ACTIONS
+        # Get batch
+        batch, batch_info = buffer.sample(self.batch_size, return_info=True)
+        (state_img_tensor, state_float_tensor, actions, rewards,
+         next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
             policy_action, policy_logprob = self.online_network(state_img_tensor, state_float_tensor, deterministic=not do_learn, with_logprob=True)
+            self.check_nan(policy_logprob, "policy_logprob")
 
             alpha_t = torch.exp(self.log_alpha.detach())
             alpha_loss = -(self.log_alpha * (policy_logprob + target_entropy).detach()).mean()
@@ -331,7 +349,10 @@ class Trainer:
                 alpha_loss.backward(retain_graph=True)
                 self.alpha_optimizer.step()
 
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
             q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
+            self.check_nan(q1, "q1")
+            self.check_nan(q2, "q2")
 
             with torch.no_grad():
                 next_policy_action, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
@@ -348,12 +369,14 @@ class Trainer:
                 q_loss.backward(retain_graph=True)
                 self.q_optimizer.step()
 
-            with torch.no_grad():
-                q1_policy, q2_policy = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
-                q_policy = torch.min(q1_policy, q2_policy)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            q1_policy, q2_policy = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
+            q_policy = torch.min(q1_policy, q2_policy)
+            self.check_nan(q_policy, "q_policy")
 
             # Entropy-regularized policy loss
-            policy_loss = (q_policy - alpha_t * policy_logprob).mean()
+            policy_loss = (alpha_t * policy_logprob - q_policy).mean()
+            self.check_nan(policy_loss, "policy_loss")
 
             if do_learn:
                 self.policy_optimizer.zero_grad()
@@ -361,13 +384,13 @@ class Trainer:
                 self.policy_optimizer.step()
 
 
-            if do_learn:
-                with torch.no_grad():
-                    for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
-                        # NB: We use an in-place operations "mul_", "add_" to update target
-                        # params, as opposed to "mul" and "add", which would make new tensors.
-                        param_targ.data.mul_(config_copy.polyak)
-                        param_targ.data.add_((1 - config_copy.polyak) * param.data)
+        if do_learn:
+            with torch.no_grad():
+                for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    param_targ.data.mul_(config_copy.polyak)
+                    param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
         return q_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_t.item()
 
