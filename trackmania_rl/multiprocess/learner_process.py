@@ -175,19 +175,23 @@ def learner_process_fn(
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
                                         weight_decay=1e-5)
+    critic_scaler = torch.amp.GradScaler("cuda")
+
     policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
         if any(x in name for x in ['q1_net', 'q2_net'])],
                                         lr=policy_lr,
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
                                         weight_decay=1e-5)
+    policy_scaler = torch.amp.GradScaler("cuda")
+
     alpha_optimizer = torch.optim.Adam([log_alpha],
                                        lr=alpha_lr,
                                        eps=config_copy.adam_epsilon,
                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2))
+    alpha_scaler = torch.amp.GradScaler("cuda")
 
 
-    scaler = torch.amp.GradScaler("cuda")
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
@@ -199,7 +203,9 @@ def learner_process_fn(
         policy_optimizer.load_state_dict(torch.load(f=save_dir / "policy_optimizer.torch", weights_only=False))
         critic_optimizer.load_state_dict(torch.load(f=save_dir / "critic_optimizer.torch", weights_only=False))
         alpha_optimizer.load_state_dict(torch.load(f=save_dir / "alpha_optimizer.torch", weights_only=False))
-        scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
+        policy_scaler.load_state_dict(torch.load(f=save_dir / "policy_scaler.torch", weights_only=False))
+        critic_scaler.load_state_dict(torch.load(f=save_dir / "critic_scaler.torch", weights_only=False))
+        alpha_scaler.load_state_dict(torch.load(f=save_dir / "alpha_scaler.torch", weights_only=False))
         print(" =========================     Optimizers loaded !     ================================")
     except:
         print(" Could not load optimizer")
@@ -229,6 +235,9 @@ def learner_process_fn(
         policy_optimizer=policy_optimizer,
         critic_optimizer=critic_optimizer,
         alpha_optimizer=alpha_optimizer,
+        policy_scaler=policy_scaler,
+        critic_scaler=critic_scaler,
+        alpha_scaler=alpha_scaler,
         batch_size=config_copy.batch_size,
         log_alpha=log_alpha,
     )
@@ -428,7 +437,9 @@ def learner_process_fn(
                     policy_optimizer,
                     critic_optimizer,
                     alpha_optimizer,
-                    scaler,
+                    policy_scaler,
+                    critic_scaler,
+                    alpha_scaler,
                 )
 
         if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
@@ -736,5 +747,5 @@ def learner_process_fn(
             #   SAVE
             # ===============================================
             print("Saving")
-            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, critic_optimizer, alpha_optimizer, scaler)
+            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, critic_optimizer, alpha_optimizer, policy_scaler, critic_scaler, alpha_scaler)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

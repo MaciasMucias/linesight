@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v5"
+run_name = "sac_run_v6"
 running_speed = 10
 
 tm_engine_step_per_action = 5
@@ -106,7 +106,8 @@ alpha_lr_schedule = [
     (15_000_000 * global_schedule_speed, 1e-5),
 ]
 alpha_initial_value = 0.2
-polyak = 0.995
+dynamic_alpha = False
+polyak = 0.99
 
 tensorboard_suffix_schedule = [
     (0, ""),
