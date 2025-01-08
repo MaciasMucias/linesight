@@ -1,7 +1,6 @@
 import copy
 import itertools
 import sys
-
 import torch
 import numpy as np
 import numpy.typing as npt
@@ -12,6 +11,8 @@ import math
 from numpy import ndarray
 from torch import Tensor
 from torch.optim import Optimizer
+
+from trackmania_rl import utilities
 from trackmania_rl.buffer_management import ReplayBuffer
 from config_files import config_copy
 
@@ -71,7 +72,7 @@ class SAC_Network(torch.nn.Module):
         self.dense_hidden_dimension = dense_hidden_dimension
         activation_function = torch.nn.LeakyReLU
 
-        self.LOG_STD_MIN = -20
+        self.LOG_STD_MIN = -5
         self.LOG_STD_MAX = 2
         self.EPS = 1e-7
 
@@ -120,8 +121,7 @@ class SAC_Network(torch.nn.Module):
         self.policy_mean = torch.nn.Linear(dense_hidden_dimension, n_actions)
         self.policy_log_std = torch.nn.Linear(dense_hidden_dimension, n_actions)
 
-        # Q-value networks
-        self.q1_net = torch.nn.Sequential(
+        q_net_builder = lambda: torch.nn.Sequential(
             torch.nn.Linear(dense_hidden_dimension + n_actions, dense_hidden_dimension),
             torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
@@ -131,15 +131,9 @@ class SAC_Network(torch.nn.Module):
             torch.nn.Linear(dense_hidden_dimension, 1)
         )
 
-        self.q2_net = torch.nn.Sequential(
-            torch.nn.Linear(dense_hidden_dimension + n_actions, dense_hidden_dimension),
-            torch.nn.LayerNorm(dense_hidden_dimension),
-            activation_function(inplace=True),
-            torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
-            torch.nn.LayerNorm(dense_hidden_dimension),
-            activation_function(inplace=True),
-            torch.nn.Linear(dense_hidden_dimension, 1)
-        )
+        # Q-value networks
+        self.q1_net = q_net_builder()
+        self.q2_net = q_net_builder()
 
         self.register_buffer('float_inputs_mean', float_inputs_mean)
         self.register_buffer('float_inputs_std', float_inputs_std)
@@ -150,28 +144,15 @@ class SAC_Network(torch.nn.Module):
 
     def initialize_weights(self) -> None:
         # Initialize convolutional layers
-        for m in self.modules():
-            if isinstance(m, torch.nn.Conv2d):
-                torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (torch.nn.BatchNorm2d, torch.nn.LayerNorm)):
-                torch.nn.init.constant_(m.weight, 1)
-                torch.nn.init.constant_(m.bias, 0)
-            elif isinstance(m, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                torch.nn.init.constant_(m.bias, 0)
+        lrelu_neg_slope = 1e-2
+        activation_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
+        for module in [self.img_head, self.float_feature_extractor, self.shared_net, self.q1_net, self.q2_net]:
+            for m in module:
+                if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
+                    utilities.init_orthogonal(m, activation_gain)
 
-            # Special initialization for policy heads
-        for module in [self.policy_mean, self.policy_log_std]:
-            torch.nn.init.uniform_(module.weight, -1e-3, 1e-3)
-            torch.nn.init.uniform_(module.bias, -1e-3, 1e-3)
-
-            # Special initialization for final Q-network layers
-        for q_net in [self.q1_net, self.q2_net]:
-            final_layer = q_net[-1]
-            torch.nn.init.uniform_(final_layer.weight, -1e-3, 1e-3)
-            torch.nn.init.uniform_(final_layer.bias, -1e-3, 1e-3)
+        for m in [self.policy_mean, self.policy_log_std]:
+            utilities.init_orthogonal(m, activation_gain)
 
     def preprocess_inputs(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         state_img_tensor = img.to(device="cuda",
@@ -200,7 +181,8 @@ class SAC_Network(torch.nn.Module):
         # Get steering distribution parameters
         mean = self.policy_mean(features)
         log_std = self.policy_log_std(features)
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = torch.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (1 + log_std)
         std = torch.exp(log_std)
 
         if torch.isnan(mean).any() or torch.isnan(std).any():
@@ -216,13 +198,15 @@ class SAC_Network(torch.nn.Module):
         else:
             policy_action = policy_distribution.rsample()
 
+        policy_action = torch.tanh(policy_action)
+
         if with_logprob:
-            policy_logprob = policy_distribution.log_prob(policy_action).sum(dim=-1)
-            policy_logprob -= (2 * (torch.log(2) - policy_action - F.softplus(-2 * policy_action))).sum(dim=1)
+            policy_logprob = policy_distribution.log_prob(policy_action)
+            policy_logprob -= torch.log(1 - policy_action.pow(2) + 1e6)  # so no log of 0
+            policy_logprob = policy_logprob.sum(dim=1)
         else:
             policy_logprob = None
 
-        policy_action = torch.tanh(policy_action)
         return policy_action, policy_logprob
 
     @torch.jit.export
@@ -230,8 +214,8 @@ class SAC_Network(torch.nn.Module):
         features = self.get_features(img, float_inputs)
         # Create new tensor for concatenation instead of modifying in place
         sa = torch.cat([features, actions], dim=-1)
-        q1 = self.q1_net(sa)
-        q2 = self.q2_net(sa)
+        q1 = self.q1_net(sa).squeeze(-1)
+        q2 = self.q2_net(sa).squeeze(-1)
         return q1, q2
 
     def to(self, *args, **kwargs):
@@ -253,62 +237,20 @@ def sac_loss(
         gammas: torch.Tensor,
         log_alpha: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        target_entropy = -N_ACTIONS
-
-        # Get current policy action and log prob
-        policy_action, policy_logprob = online_network(state_img, state_float,
-                                                       deterministic=False, with_logprob=True)
-
-        # Compute temperature parameter
-        alpha = torch.exp(log_alpha.detach())
-
-        # Alpha loss
-        alpha_loss = -(log_alpha * (policy_logprob + target_entropy).detach()).mean()
-
-        # Current Q-values
-        q1, q2 = online_network.q_values(state_img, state_float, actions)
-
-        # Compute target Q-values
-        with torch.no_grad():
-            next_policy_action, next_policy_logprob = online_network(
-                next_state_img, next_state_float,
-                deterministic=False, with_logprob=True
-            )
-
-            # Get target Q-values
-            q1_target, q2_target = target_network.q_values(
-                next_state_img, next_state_float,
-                next_policy_action
-            )
-            q_target = torch.min(q1_target, q2_target)
-
-            # Compute backup (target value)
-            done = torch.zeros_like(rewards)  # If done tensor isn't provided
-            backup = rewards + gammas * (1 - done) * (q_target - alpha * next_policy_logprob)
-
-        # Compute critic losses
-        loss_q1 = ((q1 - backup) ** 2).mean()
-        loss_q2 = ((q2 - backup) ** 2).mean()
-        critic_loss = (loss_q1 + loss_q2)/2
-
-        # Compute policy Q-values
-        q1_policy, q2_policy = online_network.q_values(state_img, state_float, policy_action)
-        q_policy = torch.min(q1_policy, q2_policy)
-
-        # Entropy-regularized policy loss
-        policy_loss = (alpha * policy_logprob - q_policy).mean()
-
-        return critic_loss, policy_loss, alpha_loss
+        pass
 
 
 class Trainer:
     def __init__(
             self,
-            online_network: torch.nn.Module,
-            target_network: torch.nn.Module,
+            online_network: SAC_Network,
+            target_network: SAC_Network,
             policy_optimizer: Optimizer,
             critic_optimizer: Optimizer,
             alpha_optimizer: Optimizer,
+            policy_scaler: GradScaler,
+            critic_scaler: GradScaler,
+            alpha_scaler: GradScaler,
             batch_size: int,
             log_alpha: torch.Tensor,
     ):
@@ -317,6 +259,9 @@ class Trainer:
         self.policy_optimizer = policy_optimizer
         self.q_optimizer = critic_optimizer
         self.alpha_optimizer = alpha_optimizer
+        self.policy_scaler = policy_scaler
+        self.q_scaler = critic_scaler
+        self.alpha_scaler = alpha_scaler
         self.batch_size = batch_size
         self.log_alpha = log_alpha
         self.train_steps = 0
@@ -329,62 +274,74 @@ class Trainer:
             print(f"NaN detected in {name}")
             raise ValueError(f"NaN in {name}")
 
+    # In the Trainer class __init__
+    def __init__(
+            self,
+            online_network: torch.nn.Module,
+            target_network: torch.nn.Module,
+            policy_optimizer: Optimizer,
+            critic_optimizer: Optimizer,
+            alpha_optimizer: Optimizer,
+            policy_scaler: GradScaler,
+            critic_scaler: GradScaler,
+            alpha_scaler: GradScaler,
+            batch_size: int,
+            log_alpha: torch.Tensor,
+    ):
+        self.online_network = online_network
+        self.target_network = target_network
+        self.policy_optimizer = policy_optimizer
+        self.q_optimizer = critic_optimizer
+        self.alpha_optimizer = alpha_optimizer
+        self.policy_scaler = policy_scaler
+        self.q_scaler = critic_scaler
+        self.alpha_scaler = alpha_scaler
+        self.batch_size = batch_size
+        self.log_alpha = log_alpha
+        self.train_steps = 0
+        self.max_grad_norm = 1.0
+
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
-        torch.autograd.set_detect_anomaly(True)
         target_entropy = -N_ACTIONS
-        # Get batch
+
         batch, batch_info = buffer.sample(self.batch_size, return_info=True)
         (state_img_tensor, state_float_tensor, actions, rewards,
          next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            policy_action, policy_logprob = self.online_network(state_img_tensor, state_float_tensor, deterministic=not do_learn, with_logprob=True)
-            self.check_nan(policy_logprob, "policy_logprob")
+        alpha_t = 0.2
+        # alpha_t = torch.exp(self.log_alpha.detach())
+        # loss_alpha = -(self.log_alpha * (policy_logprob - target_entropy).detach()).mean()
+        #
+        # if do_learn:
+        #     self.alpha_optimizer.zero_grad()
+        #     loss_alpha.backward()
+        #     self.alpha_optimizer.step()
 
-            alpha_t = torch.exp(self.log_alpha.detach())
-            alpha_loss = -(self.log_alpha * (policy_logprob + target_entropy).detach()).mean()
+        with torch.no_grad():
+            next_policy_actions, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
+            next_q1, next_q2 = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_actions)
+            min_next_q = (torch.min(next_q1, next_q2) - alpha_t * next_policy_logprob)
+            next_q_value = rewards + (1 - done) * gamma * min_next_q
 
-            if do_learn:
-                self.alpha_optimizer.zero_grad()
-                alpha_loss.backward(retain_graph=True)
-                self.alpha_optimizer.step()
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
-            self.check_nan(q1, "q1")
-            self.check_nan(q2, "q2")
-
-            with torch.no_grad():
-                next_policy_action, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
-                q1_target, q2_target = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_action)
-                q_target = torch.min(q1_target, q2_target)
-                backup = rewards + gamma * (1 - done) * (q_target - alpha_t * next_policy_logprob)
-
-            loss_q1 = ((q1 - backup) ** 2).mean()
-            loss_q2 = ((q2 - backup) ** 2).mean()
-            q_loss = (loss_q1 + loss_q2) / 2
-
-            if do_learn:
-                self.q_optimizer.zero_grad()
-                q_loss.backward(retain_graph=True)
-                self.q_optimizer.step()
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            q1_policy, q2_policy = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_action)
-            q_policy = torch.min(q1_policy, q2_policy)
-            self.check_nan(q_policy, "q_policy")
-
-            # Entropy-regularized policy loss
-            policy_loss = (alpha_t * policy_logprob - q_policy).mean()
-            self.check_nan(policy_loss, "policy_loss")
-
-            if do_learn:
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
-
+        q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, actions)
+        q1_loss, q2_loss = F.mse_loss(q1, next_q_value), F.mse_loss(q2, next_q_value)
+        loss_q = q1_loss + q2_loss
 
         if do_learn:
+            self.q_optimizer.zero_grad()
+            loss_q.backward()
+            self.q_optimizer.step()
+
+        policy_actions, policy_logprob = self.online_network(state_img_tensor, state_float_tensor, deterministic=not do_learn, with_logprob=True)
+        q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_actions)
+        q = torch.min(q1, q2)
+        loss_policy = ((alpha_t * policy_logprob) - q).mean()
+
+        if do_learn:
+            self.policy_optimizer.zero_grad()
+            loss_policy.backward()
+            self.policy_optimizer.step()
+
             with torch.no_grad():
                 for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
                     # NB: We use an in-place operations "mul_", "add_" to update target
@@ -392,7 +349,7 @@ class Trainer:
                     param_targ.data.mul_(config_copy.polyak)
                     param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
-        return q_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_t.item()
+        return loss_q.item(), loss_policy.item(), 0, alpha_t #loss_alpha.item(), alpha_t.item()
 
 
 class Inferer:

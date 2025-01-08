@@ -10,6 +10,7 @@ import sys
 import time
 import typing
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -35,6 +36,7 @@ from trackmania_rl.analysis_metrics import (
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
 
+torch.autograd.set_detect_anomaly(True)
 
 def learner_process_fn(
     rollout_queues,
@@ -107,7 +109,13 @@ def learner_process_fn(
     # ========================================================
 
     online_network, uncompiled_online_network = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-    target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
+    # target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
+    def disable_grad(model):
+        for p in model.parameters():
+            p.requires_grad = False
+        return model
+
+    target_network = disable_grad(deepcopy(online_network))
 
     print(online_network)
     utilities.count_parameters(online_network)
@@ -165,32 +173,50 @@ def learner_process_fn(
         config_copy.alpha_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
 
-    log_alpha = torch.nn.Parameter(
-        torch.ones(1, device="cuda") * config_copy.alpha_initial_value
-    )
+    log_alpha = torch.tensor(config_copy.alpha_initial_value,
+                             dtype=torch.float32,
+                             device="cuda",
+                             requires_grad=True)
 
     critic_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['policy_mean', 'policy_log_std'])],
+        if any(x in name for x in ['q1_net', 'q2_net'])],
                                         lr=critic_lr,
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
                                         weight_decay=1e-5)
-    critic_scaler = torch.amp.GradScaler("cuda")
+    critic_scaler = torch.amp.GradScaler(
+        "cuda",
+        init_scale=2**10,  # Start smaller
+        growth_factor=1.5,  # Grow more slowly (default is 2)
+        backoff_factor=0.5,  # Back off more aggressively
+        growth_interval=2000  # Increase scale less frequently
+    )
 
     policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['q1_net', 'q2_net'])],
+        if any(x in name for x in ['policy_mean', 'policy_log_std'])],
                                         lr=policy_lr,
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
                                         weight_decay=1e-5)
-    policy_scaler = torch.amp.GradScaler("cuda")
+    policy_scaler = torch.amp.GradScaler(
+        "cuda",
+        init_scale=2**10,  # Start smaller
+        growth_factor=1.5,  # Grow more slowly (default is 2)
+        backoff_factor=0.5,  # Back off more aggressively
+        growth_interval=2000  # Increase scale less frequently
+    )
 
     alpha_optimizer = torch.optim.Adam([log_alpha],
                                        lr=alpha_lr,
                                        eps=config_copy.adam_epsilon,
                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2))
-    alpha_scaler = torch.amp.GradScaler("cuda")
-
+    alpha_scaler = torch.amp.GradScaler(
+        "cuda",
+        init_scale=2**10,  # Start smaller
+        growth_factor=1.5,  # Grow more slowly (default is 2)
+        backoff_factor=0.5,  # Back off more aggressively
+        growth_interval=2000  # Increase scale less frequently
+    )
 
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_memories_generated"]
