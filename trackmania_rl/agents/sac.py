@@ -9,7 +9,7 @@ from typing import Tuple, Any
 import math
 
 from numpy import ndarray
-from torch import Tensor
+from torch import Tensor, GradScaler
 from torch.optim import Optimizer
 
 from trackmania_rl import utilities
@@ -50,12 +50,10 @@ class Normal:
         return self.loc + self.scale * epsilon
 
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
-        var = (self.scale ** 2)
-        log_scale = self.scale.log()
+        var = self.variance
+        log_scale = torch.log(self.scale)
         return -((value - self.loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
 
-    def entropy(self) -> torch.Tensor:
-        return 0.5 + 0.5 * math.log(2 * math.pi) + torch.log(self.scale)
 
 class SAC_Network(torch.nn.Module):
     def __init__(
@@ -182,8 +180,8 @@ class SAC_Network(torch.nn.Module):
         mean = self.policy_mean(features)
         log_std = self.policy_log_std(features)
         log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (1 + log_std)
-        std = torch.exp(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
 
         if torch.isnan(mean).any() or torch.isnan(std).any():
             print(features)
@@ -202,8 +200,8 @@ class SAC_Network(torch.nn.Module):
 
         if with_logprob:
             policy_logprob = policy_distribution.log_prob(policy_action)
-            policy_logprob -= torch.log(1 - policy_action.pow(2) + 1e6)  # so no log of 0
-            policy_logprob = policy_logprob.sum(dim=1)
+            policy_logprob -= torch.log(1 - policy_action.pow(2) + 1e-6)  # so no log of 0
+            policy_logprob = policy_logprob.sum(1, keepdim=True)
         else:
             policy_logprob = None
 
@@ -214,8 +212,8 @@ class SAC_Network(torch.nn.Module):
         features = self.get_features(img, float_inputs)
         # Create new tensor for concatenation instead of modifying in place
         sa = torch.cat([features, actions], dim=-1)
-        q1 = self.q1_net(sa).squeeze(-1)
-        q2 = self.q2_net(sa).squeeze(-1)
+        q1 = self.q1_net(sa).squeeze()
+        q2 = self.q2_net(sa).squeeze()
         return q1, q2
 
     def to(self, *args, **kwargs):
@@ -320,8 +318,8 @@ class Trainer:
         with torch.no_grad():
             next_policy_actions, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
             next_q1, next_q2 = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_actions)
-            min_next_q = (torch.min(next_q1, next_q2) - alpha_t * next_policy_logprob)
-            next_q_value = rewards + (1 - done) * gamma * min_next_q
+            min_next_q = (torch.min(next_q1, next_q2) - alpha_t * next_policy_logprob.squeeze())
+            next_q_value = rewards + (1 - done) * gamma * min_next_q.view(-1)
 
         q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, actions)
         q1_loss, q2_loss = F.mse_loss(q1, next_q_value), F.mse_loss(q2, next_q_value)
@@ -343,7 +341,7 @@ class Trainer:
             self.policy_optimizer.step()
 
             with torch.no_grad():
-                for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
+                for param, param_targ in zip((*self.online_network.q1_net.parameters(), *self.online_network.q2_net.parameters()), (*self.target_network.q1_net.parameters(), *self.target_network.q2_net.parameters())):
                     # NB: We use an in-place operations "mul_", "add_" to update target
                     # params, as opposed to "mul" and "add", which would make new tensors.
                     param_targ.data.mul_(config_copy.polyak)

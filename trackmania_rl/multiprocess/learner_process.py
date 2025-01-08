@@ -110,12 +110,18 @@ def learner_process_fn(
 
     online_network, uncompiled_online_network = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
     # target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-    def disable_grad(model):
-        for p in model.parameters():
-            p.requires_grad = False
-        return model
+    def make_target_network(old_network):
+        """Creates target network with gradients disabled."""
+        new_network = deepcopy(old_network)
 
-    target_network = disable_grad(deepcopy(online_network))
+        # Properly detach and disable gradients
+        for p in new_network.parameters():
+            p.detach_()
+            p.requires_grad_(False)
+
+        return new_network
+
+    target_network = make_target_network(online_network)
 
     print(online_network)
     utilities.count_parameters(online_network)
