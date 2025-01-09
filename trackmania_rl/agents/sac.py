@@ -141,16 +141,14 @@ class SAC_Network(torch.nn.Module):
         self.discrete_entropy_scale = 0.1
 
     def initialize_weights(self) -> None:
-        # Initialize convolutional layers
-        lrelu_neg_slope = 1e-2
-        activation_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
         for module in [self.img_head, self.float_feature_extractor, self.shared_net, self.q1_net, self.q2_net]:
             for m in module:
-                if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
-                    utilities.init_orthogonal(m, activation_gain)
-
-        for m in [self.policy_mean, self.policy_log_std]:
-            utilities.init_orthogonal(m, activation_gain)
+                if isinstance(m, torch.nn.Linear):
+                    torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                    torch.nn.init.constant_(m.bias, 0.0)
+                elif isinstance(m, torch.nn.LayerNorm):
+                    torch.nn.init.constant_(m.weight, 1.0)
+                    torch.nn.init.constant_(m.bias, 0.0)
 
     def preprocess_inputs(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         state_img_tensor = img.to(device="cuda",
@@ -328,12 +326,13 @@ class Trainer:
         if do_learn:
             self.q_optimizer.zero_grad()
             loss_q.backward()
+            torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), self.max_grad_norm)
             self.q_optimizer.step()
 
         policy_actions, policy_logprob = self.online_network(state_img_tensor, state_float_tensor, deterministic=not do_learn, with_logprob=True)
         q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_actions)
         q = torch.min(q1, q2)
-        loss_policy = ((alpha_t * policy_logprob) - q).mean()
+        loss_policy = (q - (alpha_t * policy_logprob)).mean()
 
         if do_learn:
             self.policy_optimizer.zero_grad()
@@ -341,9 +340,7 @@ class Trainer:
             self.policy_optimizer.step()
 
             with torch.no_grad():
-                for param, param_targ in zip((*self.online_network.q1_net.parameters(), *self.online_network.q2_net.parameters()), (*self.target_network.q1_net.parameters(), *self.target_network.q2_net.parameters())):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
+                for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
                     param_targ.data.mul_(config_copy.polyak)
                     param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
