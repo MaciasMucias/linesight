@@ -304,15 +304,9 @@ class Trainer:
         (state_img_tensor, state_float_tensor, actions, rewards,
          next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
 
-        alpha_t = 0.2
-        # alpha_t = torch.exp(self.log_alpha.detach())
-        # loss_alpha = -(self.log_alpha * (policy_logprob - target_entropy).detach()).mean()
-        #
-        # if do_learn:
-        #     self.alpha_optimizer.zero_grad()
-        #     loss_alpha.backward()
-        #     self.alpha_optimizer.step()
-
+        #alpha_t = 0.2
+        alpha_t = torch.exp(self.log_alpha.detach())
+        
         with torch.no_grad():
             next_policy_actions, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
             next_q1, next_q2 = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_actions)
@@ -334,17 +328,23 @@ class Trainer:
         q = torch.min(q1, q2)
         loss_policy = (q - (alpha_t * policy_logprob)).mean()
 
+        loss_alpha = (-self.log_alpha.exp() * (policy_logprob + target_entropy)).mean()
+
         if do_learn:
+            policy_alpha_loss = loss_alpha + loss_policy
             self.policy_optimizer.zero_grad()
-            loss_policy.backward()
+            self.alpha_optimizer.zero_grad()
+            policy_alpha_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), self.max_grad_norm)
             self.policy_optimizer.step()
+            self.alpha_optimizer.step()            
 
             with torch.no_grad():
                 for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
                     param_targ.data.mul_(config_copy.polyak)
                     param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
-        return loss_q.item(), loss_policy.item(), 0, alpha_t #loss_alpha.item(), alpha_t.item()
+        return loss_q.item(), loss_policy.item(), loss_alpha.item(), alpha_t.item()
 
 
 class Inferer:
