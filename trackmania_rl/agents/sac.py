@@ -137,8 +137,6 @@ class SAC_Network(torch.nn.Module):
         self.register_buffer('float_inputs_std', float_inputs_std)
 
         self.initialize_weights()
-        self.steer_entropy_scale = 1.0
-        self.discrete_entropy_scale = 0.1
 
     def initialize_weights(self) -> None:
         for module in [self.img_head, self.float_feature_extractor, self.shared_net, self.q1_net, self.q2_net]:
@@ -304,8 +302,8 @@ class Trainer:
         (state_img_tensor, state_float_tensor, actions, rewards,
          next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
 
-        #alpha_t = 0.2
-        alpha_t = torch.exp(self.log_alpha.detach())
+        alpha_t = 0.2
+        #alpha_t = torch.exp(self.log_alpha.detach())
         
         with torch.no_grad():
             next_policy_actions, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
@@ -328,16 +326,17 @@ class Trainer:
         q = torch.min(q1, q2)
         loss_policy = (q - (alpha_t * policy_logprob)).mean()
 
-        loss_alpha = (-self.log_alpha.exp() * (policy_logprob + target_entropy)).mean()
+        #loss_alpha = (-self.log_alpha.exp() * (policy_logprob + target_entropy)).mean()
 
         if do_learn:
-            policy_alpha_loss = loss_alpha + loss_policy
+            #policy_alpha_loss = loss_alpha + loss_policy
             self.policy_optimizer.zero_grad()
-            self.alpha_optimizer.zero_grad()
-            policy_alpha_loss.backward()
+            #self.alpha_optimizer.zero_grad()
+            #policy_alpha_loss.backward()
+            loss_policy.backward()
             torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), self.max_grad_norm)
             self.policy_optimizer.step()
-            self.alpha_optimizer.step()            
+            #self.alpha_optimizer.step()
 
             with torch.no_grad():
                 for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):

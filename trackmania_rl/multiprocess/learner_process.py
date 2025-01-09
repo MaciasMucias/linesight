@@ -334,7 +334,6 @@ def learner_process_fn(
         #   RELOAD
         # ===============================================
 
-
         for param_group in policy_optimizer.param_groups:
             param_group["lr"] = policy_lr
             param_group["epsilon"] = config_copy.adam_epsilon
@@ -367,14 +366,13 @@ def learner_process_fn(
         # ===============================================
         race_stats_to_write = {
             f"race_time_ratio_{map_name}": end_race_stats["race_time_for_ratio"] / (rollout_duration * 1000),
-            f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}":
-                end_race_stats[
-                    "race_time"
-                ] / 1000,
-            f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}":
-                end_race_stats[
-                    "race_finished"
-                ],
+            f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}": end_race_stats[
+                "race_time"
+            ]
+            / 1000,
+            f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}": end_race_stats[
+                "race_finished"
+            ],
             f"single_zone_reached_{map_status}_{map_name}": rollout_results["furthest_zone_idx"],
             "instrumentation__answer_normal_step": end_race_stats["instrumentation__answer_normal_step"],
             "instrumentation__answer_action_step": end_race_stats["instrumentation__answer_action_step"],
@@ -394,20 +392,18 @@ def learner_process_fn(
 
         if end_race_stats["race_finished"]:
             race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
-                    end_race_stats["race_time"] / 1000
+                end_race_stats["race_time"] / 1000
             )
             if not is_explo:
                 accumulated_stats["rolling_mean_ms"][map_name] = (
-                        accumulated_stats["rolling_mean_ms"].get(map_name,
-                                                                 config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
-                        * 0.9
-                        + end_race_stats["race_time"] * 0.1
+                    accumulated_stats["rolling_mean_ms"].get(map_name, config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
+                    * 0.9
+                    + end_race_stats["race_time"] * 0.1
                 )
-
         if (
-                (not is_explo)
-                and end_race_stats["race_finished"]
-                and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
+            (not is_explo)
+            and end_race_stats["race_finished"]
+            and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
         ):
             race_stats_to_write[f"eval_race_time_robust_{map_status}_{map_name}"] = end_race_stats["race_time"] / 1000
             if map_name in reference_times:
@@ -415,25 +411,21 @@ def learner_process_fn(
                     if reference_time_name in reference_times[map_name]:
                         reference_time = reference_times[map_name][reference_time_name]
                         race_stats_to_write[f"eval_ratio_{map_status}_{reference_time_name}_{map_name}"] = (
-                                100 * (end_race_stats["race_time"] / 1000) / reference_time
+                            100 * (end_race_stats["race_time"] / 1000) / reference_time
                         )
                         race_stats_to_write[f"eval_agg_ratio_{map_status}_{reference_time_name}"] = (
-                                100 * (end_race_stats["race_time"] / 1000) / reference_time
+                            100 * (end_race_stats["race_time"] / 1000) / reference_time
                         )
 
         if not is_explo:
-            # Log Q-value for starting frame
-            race_stats_to_write[f"q_value_starting_frame_{map_name}"] = end_race_stats["q_value_starting_frame"]
-
-            # Log split times
             for i, split_time in enumerate(
-                    [
-                        (e - s) / 1000
-                        for s, e in zip(
+                [
+                    (e - s) / 1000
+                    for s, e in zip(
                         end_race_stats["cp_time_ms"][:-1],
                         end_race_stats["cp_time_ms"][1:],
                     )
-                    ]
+                ]
             ):
                 race_stats_to_write[f"split_{map_name}_{i}"] = split_time
 
@@ -511,68 +503,6 @@ def learner_process_fn(
             print(f" NMG={accumulated_stats['cumul_number_memories_generated']:<8}")
 
             # ===============================================
-            #   PERIODIC RESET ?
-            # ===============================================
-
-            if neural_net_reset_counter >= config_copy.reset_every_n_frames_generated or single_reset_flag != config_copy.single_reset_flag:
-                neural_net_reset_counter = 0
-                single_reset_flag = config_copy.single_reset_flag
-                accumulated_stats[
-                    "cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
-
-                # Create fresh untrained network
-                _, untrained_sac_network = make_untrained_sac_network(config_copy.use_jit, False)
-                utilities.soft_copy_param(online_network, untrained_sac_network, config_copy.overall_reset_mul_factor)
-
-                # Reset the last layers of policy and Q networks with stronger reset factor
-                with torch.no_grad():
-                    # Reset last layer of policy network
-                    online_network.policy_mean[-1].weight = utilities.linear_combination(
-                        online_network.policy_mean[-1].weight,
-                        untrained_sac_network.policy_mean[-1].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.policy_mean[-1].bias = utilities.linear_combination(
-                        online_network.policy_mean[-1].bias,
-                        untrained_sac_network.policy_mean[-1].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
-
-                    online_network.policy_log_std[-1].weight = utilities.linear_combination(
-                        online_network.policy_log_std[-1].weight,
-                        untrained_sac_network.policy_log_std[-1].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.policy_log_std[-1].bias = utilities.linear_combination(
-                        online_network.policy_log_std[-1].bias,
-                        untrained_sac_network.policy_log_std[-1].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
-
-                    # Reset last layer of Q networks
-                    online_network.q1_net[-1].weight = utilities.linear_combination(
-                        online_network.q1_net[-1].weight,
-                        untrained_sac_network.q1_net[-1].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.q1_net[-1].bias = utilities.linear_combination(
-                        online_network.q1_net[-1].bias,
-                        untrained_sac_network.q1_net[-1].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
-
-                    online_network.q2_net[-1].weight = utilities.linear_combination(
-                        online_network.q2_net[-1].weight,
-                        untrained_sac_network.q2_net[-1].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.q2_net[-1].bias = utilities.linear_combination(
-                        online_network.q2_net[-1].bias,
-                        untrained_sac_network.q2_net[-1].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
-
-            # ===============================================
             #   LEARN ON BATCH
             # ===============================================
 
@@ -586,8 +516,7 @@ def learner_process_fn(
             ):
                 if (random.random() < config_copy.buffer_test_ratio and len(buffer_test) > 0) or len(buffer) == 0:
                     test_start_time = time.perf_counter()
-                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(
-                        buffer_test, do_learn=False)
+                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(buffer_test, do_learn=False)
                     time_testing_since_last_tensorboard_write += time.perf_counter() - test_start_time
 
                     # Store all test metrics
@@ -600,11 +529,9 @@ def learner_process_fn(
                 else:
                     train_start_time = time.perf_counter()
                     # Unpack all losses from the trainer
-                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(
-                        buffer, do_learn=True)
+                    critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(buffer, do_learn=True)
                     train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
                     time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]
-
                     accumulated_stats["cumul_number_single_memories_used"] += (
                         4 * config_copy.batch_size
                         if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
@@ -630,7 +557,6 @@ def learner_process_fn(
         # ===============================================
         save_frequency_s = 1 * 60 # 5 * 60
         if time.perf_counter() - time_last_save >= save_frequency_s:
-            print("Writing to TensorBoard")
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
             waited_percentage = time_waited_for_workers_since_last_tensorboard_write / time_since_last_save
@@ -695,9 +621,8 @@ def learner_process_fn(
             # ===============================================
             #   WRITE TO TENSORBOARD
             # ===============================================
-            walltime_tb = time.time()
 
-            # Basic network statistics
+            walltime_tb = time.time()
             for name, param in online_network.named_parameters():
                 # Categorize parameters by network type
                 if any(x in name for x in ['policy_mean', 'policy_logprob']):
@@ -721,9 +646,7 @@ def learner_process_fn(
                 walltime=walltime_tb,
             )
 
-            # Write all other statistics
             for k, v in step_stats.items():
-                print(k)
                 tensorboard_writer.add_scalar(
                     tag=k,
                     scalar_value=v,

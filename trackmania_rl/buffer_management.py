@@ -89,7 +89,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
 
         # Get action that was played
         action = rollout_results["actions"][i]
-        terminal_actions = int((n_frames - 1) - i) if "race_time" in rollout_results else math.inf
+        terminal_actions = float((n_frames - 1) - i) if "race_time" in rollout_results else math.inf
         next_state_has_passed_finish = ((i + n_steps) == (n_frames - 1)) and ("race_time" in rollout_results)
 
         if not next_state_has_passed_finish:

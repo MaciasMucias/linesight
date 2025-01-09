@@ -467,7 +467,7 @@ class GameInstanceManager:
 
                     floats = np.hstack(
                         (
-                            0, # 0
+                            0,  # 0
                             np.array(
                                 previous_actions
                             ).flatten(),  # 1 - 16
