@@ -261,12 +261,11 @@ class GameInstanceManager:
         self.iface.set_speed(requested_speed)
         self.latest_tm_engine_speed_requested = requested_speed
 
-    def request_inputs(self, action, rollout_results: Dict):
+    def request_inputs(self, action_idx: int, rollout_results: Dict):
         if (
-            len(rollout_results["actions"]) == 0 or np.any(rollout_results["actions"][-1] != action)
+            len(rollout_results["actions"]) == 0 or rollout_results["actions"][-1] != action_idx
         ):  # Small performance trick, don't update input_state if it doesn't need to be updated
-            steer, up, down = action.squeeze().tolist()
-            self.iface.set_input_state(steer * 65536, up >= 0, down >= 0)
+            self.iface.set_input_state(**config_copy.inputs[action_idx])
 
     def request_map(self, map_path: str, zone_centers: npt.NDArray):
         self.latest_map_path_requested = map_path
@@ -312,9 +311,10 @@ class GameInstanceManager:
         rollout_results = {
             "current_zone_idx": [],
             "frames": [],
+            "input_w": [],
             "actions": [],
             "car_gear_and_wheels": [],
-            "q_value": [],
+            "q_values": [],
             "meters_advanced_along_centerline": [],
             "state_float": [],
             "furthest_zone_idx": 0,
@@ -459,7 +459,7 @@ class GameInstanceManager:
                     state_car_angular_velocity_in_car_reference_system = sim_state_orientation.dot(sim_state_angular_speed)
 
                     previous_actions = [
-                        rollout_results["actions"][k] if k >= 0 else [0., 1, 0]
+                        config_copy.inputs[rollout_results["actions"][k] if k >= 0 else config_copy.action_forward_idx]
                         for k in range(
                             len(rollout_results["actions"]) - config_copy.n_prev_actions_in_inputs, len(rollout_results["actions"])
                         )
@@ -469,11 +469,15 @@ class GameInstanceManager:
                         (
                             0,  # 0
                             np.array(
-                                previous_actions
-                            ).flatten(),  # 1 - 16
-                            sim_state_car_gear_and_wheels.ravel(),  # 17 - 36
-                            state_car_angular_velocity_in_car_reference_system.ravel(), # 37 - 39
-                            state_car_velocity_in_car_reference_system.ravel(), # 40 - 42
+                                [
+                                    previous_action[input_str]
+                                    for previous_action in previous_actions
+                                    for input_str in ["accelerate", "brake", "left", "right"]
+                                ]
+                            ),  # 1 - 20
+                            sim_state_car_gear_and_wheels.ravel(),  # 21 - 40
+                            state_car_angular_velocity_in_car_reference_system.ravel(), # 41 - 43
+                            state_car_velocity_in_car_reference_system.ravel(), # 44 - 46
                             state_y_map_vector_in_car_reference_system.ravel(),
                             state_zone_center_coordinates_in_car_reference_system.ravel(),
                             min(
@@ -661,6 +665,7 @@ class GameInstanceManager:
                                 len(zone_centers) - config_copy.n_zone_centers_extrapolate_after_end_of_map
                             )
                             rollout_results["frames"].append(np.nan)
+                            rollout_results["input_w"].append(np.nan)
                             rollout_results["actions"].append(np.nan)
                             rollout_results["car_gear_and_wheels"].append(np.nan)
                             rollout_results["meters_advanced_along_centerline"].append(
@@ -698,19 +703,26 @@ class GameInstanceManager:
                         instrumentation__convert_frame += pc7 - pc6
 
                         (
-                            action,
-                            q_value
+                            action_idx,
+                            q_value,
+                            q_values,
                         ) = exploration_policy(rollout_results["frames"][-1], floats)
 
                         pc8 = time.perf_counter_ns()
                         instrumentation__exploration_policy += pc8 - pc7
-                        self.request_inputs(action, rollout_results)
+
+                        self.request_inputs(action_idx, rollout_results)
                         self.request_speed(self.running_speed)
 
+                        if n_th_action_we_compute == 0:
+                            end_race_stats["value_starting_frame"] = q_value
+                            for i, val in enumerate(np.nditer(q_values)):
+                                end_race_stats[f"q_value_{i}_starting_frame"] = val
                         rollout_results["meters_advanced_along_centerline"].append(distance_since_track_begin)
-                        rollout_results["actions"].append(action.flatten())
+                        rollout_results["input_w"].append(config_copy.inputs[action_idx]["accelerate"])
+                        rollout_results["actions"].append(action_idx)
                         rollout_results["car_gear_and_wheels"].append(sim_state_car_gear_and_wheels)
-                        rollout_results["q_value"].append(q_value)
+                        rollout_results["q_values"].append(q_values)
                         rollout_results["state_float"].append(floats)
 
                         compute_action_asap = False

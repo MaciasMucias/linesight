@@ -63,7 +63,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
             rollout_results["meters_advanced_along_centerline"][i] - rollout_results["meters_advanced_along_centerline"][i - 1]
         ) * config_copy.reward_per_m_advanced_along_centerline
         if i < n_frames - 1:
-            speed_vector_start = 40
+            speed_vector_start = 44
             speed_vector_end = speed_vector_start + 2 # 3d, 1 already at start
             if config_copy.final_speed_reward_per_m_per_s != 0 and rollout_results["state_float"][i][speed_vector_end] > 0:
                 # car has velocity *forward*

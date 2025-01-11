@@ -57,9 +57,9 @@ def learner_process_fn(
                         "^single_zone_reached",
                     ],
                 ],
-                "critic_evaluation": [
+                "avg_Q": [
                     "Multiline",
-                    ["^Q_value"],
+                    ["avg_Q"],
                 ],
                 "critic_loss": [
                     "Multiline",
@@ -109,19 +109,6 @@ def learner_process_fn(
     # ========================================================
 
     online_network, uncompiled_online_network = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-    # target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-    def make_target_network(old_network):
-        """Creates target network with gradients disabled."""
-        new_network = deepcopy(old_network)
-
-        # Properly detach and disable gradients
-        for p in new_network.parameters():
-            p.detach_()
-            p.requires_grad_(False)
-
-        return new_network
-
-    target_network = make_target_network(online_network)
 
     print(online_network)
     utilities.count_parameters(online_network)
@@ -143,7 +130,6 @@ def learner_process_fn(
     # noinspection PyBroadException
     try:
         online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
         print(" =====================     Learner weights loaded !     ============================")
     except:
         print(" Learner could not load weights")
@@ -199,7 +185,7 @@ def learner_process_fn(
     )
 
     policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['policy_mean', 'policy_log_std'])],
+        if any(x in name for x in ['action_logits'])],
                                         lr=policy_lr,
                                         eps=config_copy.adam_epsilon,
                                         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
@@ -262,8 +248,7 @@ def learner_process_fn(
     # Make the trainer
     # ========================================================
     trainer = sac.Trainer(
-        online_network=online_network,
-        target_network=target_network,
+        network=online_network,
         policy_optimizer=policy_optimizer,
         critic_optimizer=critic_optimizer,
         alpha_optimizer=alpha_optimizer,
@@ -388,7 +373,7 @@ def learner_process_fn(
         print("Race time ratio  ", race_stats_to_write[f"race_time_ratio_{map_name}"])
 
         if not is_explo:
-            race_stats_to_write[f"Q_value_{map_status}_{map_name}"] = np.mean(rollout_results["q_value"])
+            race_stats_to_write[f"avg_Q_{map_status}_{map_name}"] = np.mean(rollout_results["q_values"])
 
         if end_race_stats["race_finished"]:
             race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
@@ -457,7 +442,6 @@ def learner_process_fn(
                 utilities.save_checkpoint(
                     save_dir / "best_runs",
                     online_network,
-                    target_network,
                     policy_optimizer,
                     critic_optimizer,
                     alpha_optimizer,
@@ -631,7 +615,6 @@ def learner_process_fn(
                     prefix = "q"
                 else:
                     prefix = "shared"
-                print(f"{prefix}/{name}_L2")
                 tensorboard_writer.add_scalar(
                     tag=f"{prefix}/{name}_L2",
                     scalar_value=np.sqrt((param ** 2).mean().detach().cpu().item()),
@@ -701,6 +684,5 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
-            print("Saving")
-            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, critic_optimizer, alpha_optimizer, policy_scaler, critic_scaler, alpha_scaler)
+            utilities.save_checkpoint(save_dir, online_network, policy_optimizer, critic_optimizer, alpha_optimizer, policy_scaler, critic_scaler, alpha_scaler)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

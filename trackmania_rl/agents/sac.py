@@ -10,6 +10,8 @@ import math
 
 from numpy import ndarray
 from torch import Tensor, GradScaler
+from torch.backends.cudnn import deterministic
+from torch.distributions import Categorical
 from torch.optim import Optimizer
 
 from trackmania_rl import utilities
@@ -17,43 +19,7 @@ from trackmania_rl.buffer_management import ReplayBuffer
 from config_files import config_copy
 
 
-N_ACTIONS = len(["steer", "gas", "break"])
-
-class Normal:
-    """Jit workaroung"""
-    @property
-    def mean(self):
-        return self.loc
-
-    @property
-    def stddev(self):
-        return self.scale
-
-    @property
-    def variance(self):
-        return self.stddev.pow(2)
-
-    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
-        resized_ = torch.broadcast_tensors(loc, scale)
-        self.loc = resized_[0]
-        self.scale = resized_[1]
-        self._batch_shape = list(self.loc.size())
-
-    def _extended_shape(self, sample_shape: list[int]) -> list[int]:
-        return sample_shape + self._batch_shape
-
-    def sample(self) -> torch.Tensor:
-        return torch.normal(self.loc.expand(self._batch_shape), self.scale.expand(self._batch_shape))
-
-    def rsample(self) -> torch.Tensor:
-        epsilon = torch.randn_like(self.scale)
-        return self.loc + self.scale * epsilon
-
-    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
-        var = self.variance
-        log_scale = torch.log(self.scale)
-        return -((value - self.loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
-
+N_ACTIONS = len(["left", "right", "gas", "break"])
 
 class SAC_Network(torch.nn.Module):
     def __init__(
@@ -68,6 +34,7 @@ class SAC_Network(torch.nn.Module):
     ):
         super().__init__()
         self.dense_hidden_dimension = dense_hidden_dimension
+        self.dense_input_dimension = conv_head_output_dim + float_hidden_dim
         activation_function = torch.nn.LeakyReLU
 
         self.LOG_STD_MIN = -5
@@ -76,7 +43,7 @@ class SAC_Network(torch.nn.Module):
 
         # Image processing head
         img_head_channels = [1, 16, 32, 64, 32]
-        self.img_head = torch.nn.Sequential(
+        img_head_builder = lambda: torch.nn.Sequential(
             torch.nn.Conv2d(img_head_channels[0], img_head_channels[1], kernel_size=(4, 4), stride=2),
             torch.nn.BatchNorm2d(img_head_channels[1]),
             activation_function(inplace=True),
@@ -92,8 +59,10 @@ class SAC_Network(torch.nn.Module):
             torch.nn.Flatten(),
         )
 
-        # Float feature processing
-        self.float_feature_extractor = torch.nn.Sequential(
+        self.policy_img_head = img_head_builder()
+        self.q_img_head = img_head_builder()
+
+        float_feature_extractor_builder = lambda: torch.nn.Sequential(
             torch.nn.Linear(float_inputs_dim, float_hidden_dim),
             torch.nn.LayerNorm(float_hidden_dim),
             activation_function(inplace=True),
@@ -102,11 +71,11 @@ class SAC_Network(torch.nn.Module):
             activation_function(inplace=True),
         )
 
-        # Combined features dimension
-        self.dense_input_dimension = conv_head_output_dim + float_hidden_dim
+        # Float feature processing
+        self.policy_float_feature_extractor = float_feature_extractor_builder()
+        self.q_float_feature_extractor = float_feature_extractor_builder()
 
-        # Shared feature network
-        self.shared_net = torch.nn.Sequential(
+        shared_net_builder = lambda: torch.nn.Sequential(
             torch.nn.Linear(self.dense_input_dimension, dense_hidden_dimension),
             torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
@@ -115,38 +84,48 @@ class SAC_Network(torch.nn.Module):
             activation_function(inplace=True),
         )
 
+
+        # Shared feature network
+        self.policy_shared_net = shared_net_builder()
+        self.q_shared_net = shared_net_builder()
+
         # Policy heads
-        self.policy_mean = torch.nn.Linear(dense_hidden_dimension, n_actions)
-        self.policy_log_std = torch.nn.Linear(dense_hidden_dimension, n_actions)
+        self.action_logits = torch.nn.Linear(dense_hidden_dimension, n_actions)
 
         q_net_builder = lambda: torch.nn.Sequential(
-            torch.nn.Linear(dense_hidden_dimension + n_actions, dense_hidden_dimension),
+            torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
             torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension, dense_hidden_dimension),
             torch.nn.LayerNorm(dense_hidden_dimension),
             activation_function(inplace=True),
-            torch.nn.Linear(dense_hidden_dimension, 1)
+            torch.nn.Linear(dense_hidden_dimension, n_actions)
         )
 
         # Q-value networks
         self.q1_net = q_net_builder()
         self.q2_net = q_net_builder()
 
-        self.register_buffer('float_inputs_mean', float_inputs_mean)
-        self.register_buffer('float_inputs_std', float_inputs_std)
+        self.q1_target_net = q_net_builder()
+        self.q2_target_net = q_net_builder()
+
+        self.q1_target_net.load_state_dict(self.q1_net.state_dict())
+        self.q2_target_net.load_state_dict(self.q2_net.state_dict())
+
+
+        self.float_inputs_mean = float_inputs_mean.clone().detach().to(dtype=torch.float32, device="cuda")
+        self.float_inputs_std = float_inputs_std.clone().detach().to(dtype=torch.float32, device="cuda")
 
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
-        for module in [self.img_head, self.float_feature_extractor, self.shared_net, self.q1_net, self.q2_net]:
-            for m in module:
-                if isinstance(m, torch.nn.Linear):
-                    torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                    torch.nn.init.constant_(m.bias, 0.0)
-                elif isinstance(m, torch.nn.LayerNorm):
-                    torch.nn.init.constant_(m.weight, 1.0)
-                    torch.nn.init.constant_(m.bias, 0.0)
+        for m in self.modules():
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                torch.nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.constant_(m.weight, 1.0)
+                torch.nn.init.constant_(m.bias, 0.0)
 
     def preprocess_inputs(self, img: torch.Tensor, float_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         state_img_tensor = img.to(device="cuda",
@@ -155,61 +134,51 @@ class SAC_Network(torch.nn.Module):
                                   non_blocking=True)
         state_img_tensor = ((state_img_tensor.float() - 128) / 128)
 
+
         state_float_tensor = float_inputs.to(device="cuda",
                                              dtype=torch.float32,
                                              non_blocking=True)
-        return state_img_tensor, state_float_tensor
-
-    def get_features(self, img: torch.Tensor, float_inputs: torch.Tensor) -> torch.Tensor:
-        """Get features using preprocessed inputs"""
-        img, float_inputs = self.preprocess_inputs(img, float_inputs)
-
-        img_outputs = self.img_head(img)
-        float_outputs = self.float_feature_extractor(float_inputs)
-        features = torch.cat((img_outputs, float_outputs), 1)
-        return self.shared_net(features)
-
-    def forward(self, img: torch.Tensor, float_inputs: torch.Tensor,
-                deterministic: bool, with_logprob: bool) -> tuple[Tensor, Tensor | None]:
-        features = self.get_features(img, float_inputs)
-        # Get steering distribution parameters
-        mean = self.policy_mean(features)
-        log_std = self.policy_log_std(features)
-        log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
-        std = log_std.exp()
-
-        if torch.isnan(mean).any() or torch.isnan(std).any():
-            print(features)
-            print(mean)
-            print(log_std)
-            print(std)
-            raise ValueError("NaN detected in policy distribution parameters")
-
-        policy_distribution = Normal(mean, std)
-        if deterministic:
-            policy_action = mean
-        else:
-            policy_action = policy_distribution.rsample()
-
-        policy_action = torch.tanh(policy_action)
-
-        if with_logprob:
-            policy_logprob = policy_distribution.log_prob(policy_action)
-            policy_logprob -= torch.log(1 - policy_action.pow(2) + 1e-6)  # so no log of 0
-            policy_logprob = policy_logprob.sum(1, keepdim=True)
-        else:
-            policy_logprob = None
-
-        return policy_action, policy_logprob
+        return state_img_tensor, (state_float_tensor - self.float_inputs_mean) / self.float_inputs_std
 
     @torch.jit.export
-    def q_values(self, img: torch.Tensor, float_inputs: torch.Tensor, actions: torch.Tensor):
-        features = self.get_features(img, float_inputs)
-        # Create new tensor for concatenation instead of modifying in place
-        sa = torch.cat([features, actions], dim=-1)
-        q1 = self.q1_net(sa).squeeze()
-        q2 = self.q2_net(sa).squeeze()
+    def forward(self, img: torch.Tensor, float_inputs: torch.Tensor, deterministic: bool) -> tuple[Tensor, Tensor, Tensor]:
+        img, float_inputs = self.preprocess_inputs(img, float_inputs)
+        img_outputs = self.policy_img_head(img)
+        float_outputs = self.policy_float_feature_extractor(float_inputs)
+        features = self.policy_shared_net(torch.cat((img_outputs, float_outputs), dim=-1))
+
+        # Get steering distribution parameters
+        logits = self.action_logits(features)
+
+        logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+        probs = F.softmax(logits, dim=-1)
+        if deterministic:
+            action = torch.argmax(probs).squeeze(-1)
+        else:
+            action = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        log_prob = F.log_softmax(logits, dim=-1)
+
+        return action, log_prob, probs
+
+    def q_get_features(self, img: torch.Tensor, float_inputs: torch.Tensor) -> torch.Tensor:
+        """Get features using preprocessed inputs"""
+        img, float_inputs = self.preprocess_inputs(img, float_inputs)
+        img_outputs = self.q_img_head(img)
+        float_outputs = self.q_float_feature_extractor(float_inputs)
+        return self.q_shared_net(torch.cat((img_outputs, float_outputs), dim=-1))
+
+    @torch.jit.export
+    def q_values(self, img: torch.Tensor, float_inputs: torch.Tensor):
+        features = self.q_get_features(img, float_inputs)
+        q1 = self.q1_net(features)
+        q2 = self.q2_net(features)
+        return q1, q2
+
+    @torch.jit.export
+    def target_q_values(self, img: torch.Tensor, float_inputs: torch.Tensor):
+        features = self.q_get_features(img, float_inputs)
+        q1 = self.q1_target_net(features)
+        q2 = self.q2_target_net(features)
         return q1, q2
 
     def to(self, *args, **kwargs):
@@ -220,8 +189,7 @@ class SAC_Network(torch.nn.Module):
 
 @torch.compile(disable=not config_copy.is_linux, dynamic=False)
 def sac_loss(
-        online_network: torch.nn.Module,
-        target_network: torch.nn.Module,
+        network: torch.nn.Module,
         state_img: torch.Tensor,
         state_float: torch.Tensor,
         actions: torch.Tensor,
@@ -237,8 +205,7 @@ def sac_loss(
 class Trainer:
     def __init__(
             self,
-            online_network: SAC_Network,
-            target_network: SAC_Network,
+            network: SAC_Network,
             policy_optimizer: Optimizer,
             critic_optimizer: Optimizer,
             alpha_optimizer: Optimizer,
@@ -248,8 +215,7 @@ class Trainer:
             batch_size: int,
             log_alpha: torch.Tensor,
     ):
-        self.online_network = online_network
-        self.target_network = target_network
+        self.network = network
         self.policy_optimizer = policy_optimizer
         self.q_optimizer = critic_optimizer
         self.alpha_optimizer = alpha_optimizer
@@ -271,8 +237,7 @@ class Trainer:
     # In the Trainer class __init__
     def __init__(
             self,
-            online_network: torch.nn.Module,
-            target_network: torch.nn.Module,
+            network: torch.nn.Module,
             policy_optimizer: Optimizer,
             critic_optimizer: Optimizer,
             alpha_optimizer: Optimizer,
@@ -282,8 +247,7 @@ class Trainer:
             batch_size: int,
             log_alpha: torch.Tensor,
     ):
-        self.online_network = online_network
-        self.target_network = target_network
+        self.network = network
         self.policy_optimizer = policy_optimizer
         self.q_optimizer = critic_optimizer
         self.alpha_optimizer = alpha_optimizer
@@ -295,6 +259,7 @@ class Trainer:
         self.train_steps = 0
         self.max_grad_norm = 1.0
 
+    @torch.compile(disable=not config_copy.is_linux, dynamic=False)
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
         target_entropy = -N_ACTIONS
 
@@ -302,55 +267,64 @@ class Trainer:
         (state_img_tensor, state_float_tensor, actions, rewards,
          next_state_img_tensor, next_state_float_tensor, gamma, done) = batch
 
+        if actions.dtype != torch.int64:
+            actions = actions.to(dtype=torch.int64)
+
         alpha_t = 0.2
         #alpha_t = torch.exp(self.log_alpha.detach())
         
         with torch.no_grad():
-            next_policy_actions, next_policy_logprob = self.online_network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn, with_logprob=True)
-            next_q1, next_q2 = self.target_network.q_values(next_state_img_tensor, next_state_float_tensor, next_policy_actions)
-            min_next_q = (torch.min(next_q1, next_q2) - alpha_t * next_policy_logprob.squeeze())
-            next_q_value = rewards + (1 - done) * gamma * min_next_q.view(-1)
+            _, next_policy_logprob, next_policy_action_probs = self.network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn)
+            next_target_q1, next_target_q2 = self.network.target_q_values(next_state_img_tensor, next_state_float_tensor)
+            min_next_target_q = next_policy_action_probs * (torch.min(next_target_q1, next_target_q2) - alpha_t * next_policy_logprob)
+            min_next_target_q = min_next_target_q.sum(dim=1)
+            next_q_value = rewards + (1 - done) * gamma * min_next_target_q.view(-1)
 
-        q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, actions)
-        q1_loss, q2_loss = F.mse_loss(q1, next_q_value), F.mse_loss(q2, next_q_value)
+        q1, q2 = self.network.q_values(state_img_tensor, state_float_tensor)
+        q1_action_value, q2_action_value = q1.gather(1, actions.unsqueeze(-1)).squeeze(), q2.gather(1, actions.unsqueeze(-1)).squeeze()
+        q1_loss, q2_loss = F.mse_loss(q1_action_value, next_q_value), F.mse_loss(q2_action_value, next_q_value)
+        print(f"next_q_value={next_q_value[0].item()}, q1_action_value={q1_action_value[0].item()}, q2_action_value={q1_action_value[0].item()}")
         loss_q = q1_loss + q2_loss
 
         if do_learn:
             self.q_optimizer.zero_grad()
             loss_q.backward()
-            torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), self.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
             self.q_optimizer.step()
 
-        policy_actions, policy_logprob = self.online_network(state_img_tensor, state_float_tensor, deterministic=not do_learn, with_logprob=True)
-        q1, q2 = self.online_network.q_values(state_img_tensor, state_float_tensor, policy_actions)
-        q = torch.min(q1, q2)
-        loss_policy = (q - (alpha_t * policy_logprob)).mean()
+        _, policy_logprob, policy_action_probs = self.network(state_img_tensor, state_float_tensor, deterministic=not do_learn)
+        with torch.no_grad():
+            q1, q2 = self.network.q_values(state_img_tensor, state_float_tensor)
+            q = torch.min(q1, q2)
+        loss_policy = (policy_action_probs * ((alpha_t * policy_logprob) - q)).mean()
 
         #loss_alpha = (-self.log_alpha.exp() * (policy_logprob + target_entropy)).mean()
 
         if do_learn:
-            #policy_alpha_loss = loss_alpha + loss_policy
+            # policy_alpha_loss = loss_alpha + loss_policy
             self.policy_optimizer.zero_grad()
-            #self.alpha_optimizer.zero_grad()
-            #policy_alpha_loss.backward()
+            # self.alpha_optimizer.zero_grad()
+            # policy_alpha_loss.backward()
             loss_policy.backward()
-            torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), self.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
             self.policy_optimizer.step()
-            #self.alpha_optimizer.step()
+            # self.alpha_optimizer.step()
 
             with torch.no_grad():
-                for param, param_targ in zip(self.online_network.parameters(), self.target_network.parameters()):
+                for param, param_targ in zip(
+                        (*self.network.q1_net.parameters(), *self.network.q2_net.parameters()), (*self.network.q1_target_net.parameters(), *self.network.q2_net.parameters())
+                ):
                     param_targ.data.mul_(config_copy.polyak)
                     param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
-        return loss_q.item(), loss_policy.item(), loss_alpha.item(), alpha_t.item()
+        return loss_q.item(), loss_policy.item(), 0, alpha_t  # loss_alpha.item(), alpha_t.item()
 
 
 class Inferer:
     """Handles inference for SAC policy network"""
     __slots__ = ("inference_network", "is_explo")
 
-    def __init__(self, inference_network: torch.nn.Module):
+    def __init__(self, inference_network: SAC_Network):
         self.inference_network = inference_network
         self.is_explo = None
 
@@ -360,40 +334,25 @@ class Inferer:
         float_inputs = torch.Tensor(float_inputs).unsqueeze(0)
 
         with torch.no_grad():
-            policy_action, _ = self.inference_network(
-                img_inputs_uint8,
-                float_inputs,
-                deterministic=True,
-                with_logprob=False
-            )
-
             q1, q2 = self.inference_network.q_values(
                 img_inputs_uint8,
-                float_inputs,
-                policy_action
+                float_inputs
             )
 
             return torch.min(q1, q2).cpu().numpy()
 
-    def get_exploration_action(self, img_inputs_uint8: npt.NDArray, float_inputs: npt.NDArray) -> tuple[ndarray, ndarray]:
+    def get_exploration_action(self, img_inputs_uint8: npt.NDArray, float_inputs: npt.NDArray) -> tuple[ndarray, ndarray, ndarray]:
+        q_values = self.infer_network(img_inputs_uint8, float_inputs)
         img_inputs_uint8 = torch.Tensor(img_inputs_uint8).unsqueeze(0)
         float_inputs = torch.Tensor(float_inputs).unsqueeze(0)
 
         with torch.no_grad():
-            policy_action, _ = self.inference_network(
+            policy_action, _, policy_action_probs = self.inference_network(
                 img_inputs_uint8,
                 float_inputs,
-                deterministic=False,
-                with_logprob=False
+                not self.is_explo
             )
-
-            q1, q2 = self.inference_network.q_values(
-                img_inputs_uint8,
-                float_inputs,
-                policy_action
-            )
-
-            return policy_action.cpu().numpy(), torch.min(q1, q2).cpu().numpy()
+        return policy_action.item(), np.max(q_values), q_values
 
 
 def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SAC_Network, SAC_Network]:
@@ -422,7 +381,7 @@ def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SAC_Netwo
         float_hidden_dim=config_copy.float_hidden_dim,
         conv_head_output_dim=config_copy.conv_head_output_dim,
         dense_hidden_dimension=config_copy.dense_hidden_dimension,
-        n_actions=N_ACTIONS,
+        n_actions=len(config_copy.inputs),
         float_inputs_mean=float_inputs_mean,
         float_inputs_std=float_inputs_std,
     )

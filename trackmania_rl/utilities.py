@@ -180,7 +180,6 @@ def save_run(
 def save_checkpoint(
     checkpoint_dir: Path,
     online_network: torch.nn.Module,
-    target_network: torch.nn.Module,
     policy_optimizer: torch.optim.Optimizer,
     q_optimizer: torch.optim.Optimizer,
     alpha_optimizer: torch.optim.Optimizer,
@@ -190,7 +189,6 @@ def save_checkpoint(
 ):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     torch.save(online_network.state_dict(), checkpoint_dir / "weights1.torch")
-    torch.save(target_network.state_dict(), checkpoint_dir / "weights2.torch")
     torch.save(policy_optimizer.state_dict(), checkpoint_dir / "policy_optimizer.torch")
     torch.save(q_optimizer.state_dict(), checkpoint_dir / "q_optimizer.torch")
     torch.save(alpha_optimizer.state_dict(), checkpoint_dir / "alpha_optimizer.torch")

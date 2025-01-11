@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v7"
+run_name = "d_sac_run_v1"
 running_speed = 10
 
 tm_engine_step_per_action = 5
@@ -71,7 +71,7 @@ n_steps = 3
 constant_reward_per_ms = -6 / 5000
 reward_per_m_advanced_along_centerline = 5 / 500
 
-float_input_dim = 27 + 3 * n_zone_centers_in_inputs + 3 * n_prev_actions_in_inputs + 4 * n_contact_material_physics_behavior_types + 1
+float_input_dim = 27 + 3 * n_zone_centers_in_inputs + 4 * n_prev_actions_in_inputs + 4 * n_contact_material_physics_behavior_types + 1
 float_hidden_dim = 256
 conv_head_output_dim = 5632
 dense_hidden_dimension = 1024
@@ -107,7 +107,7 @@ alpha_lr_schedule = [
 ]
 alpha_initial_value = 0.2
 dynamic_alpha = False
-polyak = 0.99
+polyak = 0
 
 tensorboard_suffix_schedule = [
     (0, ""),
@@ -158,7 +158,7 @@ n_pixels_to_crop_on_each_side = 2
 
 max_rollout_queue_size = 1
 
-use_jit = True
+use_jit = False
 
 # gpu_collectors_count is the number of Trackmania instances that will be launched in parallel.
 # It is recommended that users adjust this number depending on the performance of their machine.
