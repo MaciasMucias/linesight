@@ -174,7 +174,7 @@ print(soft_Q_model1)
 print(policy_model)
 print(logalpha_model)
 
-accumulated_stats: defaultdict[str | typing.Any] = defaultdict(int)
+accumulated_stats = defaultdict(int)
 accumulated_stats["alltime_min_ms"] = {}
 
 # ========================================================
