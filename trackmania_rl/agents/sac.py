@@ -140,7 +140,6 @@ class SAC_Network(torch.nn.Module):
                                              non_blocking=True)
         return state_img_tensor, (state_float_tensor - self.float_inputs_mean) / self.float_inputs_std
 
-    @torch.jit.export
     def forward(self, img: torch.Tensor, float_inputs: torch.Tensor, deterministic: bool) -> tuple[Tensor, Tensor, Tensor]:
         img, float_inputs = self.preprocess_inputs(img, float_inputs)
         img_outputs = self.policy_img_head(img)
@@ -149,14 +148,13 @@ class SAC_Network(torch.nn.Module):
 
         # Get steering distribution parameters
         logits = self.action_logits(features)
-
         logits = logits - logits.logsumexp(dim=-1, keepdim=True)
         probs = F.softmax(logits, dim=-1)
         if deterministic:
             action = torch.argmax(probs).squeeze(-1)
         else:
             action = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        log_prob = F.log_softmax(logits, dim=-1)
+        log_prob = F.log_softmax(logits, dim=-1) #Check if dim=1 gives same results
 
         return action, log_prob, probs
 
@@ -225,43 +223,11 @@ class Trainer:
         self.batch_size = batch_size
         self.log_alpha = log_alpha
         self.train_steps = 0
-
-        self.scaler = torch.amp.GradScaler('cuda')
-        self.max_grad_norm = 1.0
-
-    def check_nan(self, tensor: torch.Tensor, name: str):
-        if torch.isnan(tensor).any():
-            print(f"NaN detected in {name}")
-            raise ValueError(f"NaN in {name}")
-
-    # In the Trainer class __init__
-    def __init__(
-            self,
-            network: torch.nn.Module,
-            policy_optimizer: Optimizer,
-            critic_optimizer: Optimizer,
-            alpha_optimizer: Optimizer,
-            policy_scaler: GradScaler,
-            critic_scaler: GradScaler,
-            alpha_scaler: GradScaler,
-            batch_size: int,
-            log_alpha: torch.Tensor,
-    ):
-        self.network = network
-        self.policy_optimizer = policy_optimizer
-        self.q_optimizer = critic_optimizer
-        self.alpha_optimizer = alpha_optimizer
-        self.policy_scaler = policy_scaler
-        self.q_scaler = critic_scaler
-        self.alpha_scaler = alpha_scaler
-        self.batch_size = batch_size
-        self.log_alpha = log_alpha
-        self.train_steps = 0
-        self.max_grad_norm = 1.0
+        self.max_grad_norm = 1
 
     @torch.compile(disable=not config_copy.is_linux, dynamic=False)
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
-        target_entropy = -N_ACTIONS
+        target_entropy = -0.89 *  torch.log(1 / torch.tensor(N_ACTIONS))
 
         batch, batch_info = buffer.sample(self.batch_size, return_info=True)
         (state_img_tensor, state_float_tensor, actions, rewards,
@@ -270,8 +236,8 @@ class Trainer:
         if actions.dtype != torch.int64:
             actions = actions.to(dtype=torch.int64)
 
-        alpha_t = 0.2
-        #alpha_t = torch.exp(self.log_alpha.detach())
+        #alpha_t = 0.2
+        alpha_t = torch.exp(self.log_alpha.detach())
         
         with torch.no_grad():
             _, next_policy_logprob, next_policy_action_probs = self.network(next_state_img_tensor, next_state_float_tensor, deterministic=not do_learn)
@@ -310,6 +276,14 @@ class Trainer:
             self.policy_optimizer.step()
             # self.alpha_optimizer.step()
 
+        loss_alpha = (policy_action_probs.detach() * (-self.log_alpha.exp() * (policy_logprob + target_entropy).detach())).mean()
+
+        if do_learn:
+            self.alpha_optimizer.zero_grad()
+            loss_alpha.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+            self.alpha_optimizer.step()
+
             with torch.no_grad():
                 for param, param_targ in zip(
                         (*self.network.q1_net.parameters(), *self.network.q2_net.parameters()), (*self.network.q1_target_net.parameters(), *self.network.q2_net.parameters())
@@ -317,7 +291,7 @@ class Trainer:
                     param_targ.data.mul_(config_copy.polyak)
                     param_targ.data.add_((1 - config_copy.polyak) * param.data)
 
-        return loss_q.item(), loss_policy.item(), 0, alpha_t  # loss_alpha.item(), alpha_t.item()
+        return loss_q.item(), loss_policy.item(), loss_alpha.item(), alpha_t.item()
 
 
 class Inferer:
