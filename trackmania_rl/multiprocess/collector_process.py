@@ -38,13 +38,13 @@ def collector_process_fn(
         tmi_port=tmi_port,
     )
 
-    inference_network, uncompiled_inference_network = iqn.make_untrained_iqn_network(config_copy.use_jit, is_inference=True)
+    inference_network, uncompiled_inference_network = iqn.make_untrained_PolicyNetwork(config_copy.use_jit)
     try:
         inference_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
     except Exception as e:
         print("Worker could not load weights, exception:", e)
 
-    inferer = iqn.Inferer(inference_network, config_copy.iqn_k, config_copy.tau_epsilon_boltzmann)
+    inferer = iqn.Inferer(inference_network)
 
     def update_network():
         # Update weights of the inference network

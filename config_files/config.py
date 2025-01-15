@@ -325,3 +325,12 @@ map_cycle += [
     # repeat(("A07", f'"Official Maps/A07-Race.Challenge.Gbx"', f"A07-Race_0.5m_raceta.npy", True, True), 4),
     # repeat(("A07", f'"Official Maps/A07-Race.Challenge.Gbx"', f"A07-Race_0.5m_raceta.npy", False, True), 1),
 ]
+
+typical_target_policy = np.array([90, 8, 1, 0.1, 0.05, 0.01, 0.001, 0.0001, 0.00001, 0.000001, 0.0000001, 0.00000001])
+typical_target_policy /= typical_target_policy.sum()
+entropy_of_typical_target_policy = -(np.log(typical_target_policy) * typical_target_policy).sum()
+
+# target_entropy = 0.98 * (-np.log(1 / len(inputs)))  # approx 2.435 #as per SAC Discrete paper
+target_entropy = entropy_of_typical_target_policy
+truncation_amplitude = 0.92
+sac_alpha = 0.01

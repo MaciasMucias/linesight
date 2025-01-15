@@ -114,7 +114,6 @@ def fill_buffer_from_rollout_with_n_steps_rule(
 
         state_img = rollout_results["frames"][i]
         state_float = rollout_results["state_float"][i]
-        state_potential = get_potential(rollout_results["state_float"][i])
 
         # Get action that was played
         action = rollout_results["actions"][i]
@@ -124,24 +123,20 @@ def fill_buffer_from_rollout_with_n_steps_rule(
         if not next_state_has_passed_finish:
             next_state_img = rollout_results["frames"][i + n_steps]
             next_state_float = rollout_results["state_float"][i + n_steps]
-            next_state_potential = get_potential(rollout_results["state_float"][i + n_steps])
         else:
             # It doesn't matter what next_state_img and next_state_float contain, as the transition will be forced to be final
             next_state_img = state_img
             next_state_float = state_float
-            next_state_potential = 0
 
         list_to_fill.append(
             Experience(
                 state_img,
                 state_float,
-                state_potential,
                 action,
                 n_steps,
                 rewards,
                 next_state_img,
                 next_state_float,
-                next_state_potential,
                 gammas,
                 terminal_actions,
             )

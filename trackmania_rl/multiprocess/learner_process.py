@@ -17,6 +17,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
+import torch_optimizer
 from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
@@ -24,7 +25,6 @@ from torchrl.data.replay_buffers import PrioritizedSampler
 from config_files import config_copy
 from trackmania_rl import buffer_management, utilities
 from trackmania_rl.agents import iqn as iqn
-from trackmania_rl.agents.iqn import make_untrained_iqn_network
 from trackmania_rl.analysis_metrics import (
     distribution_curves,
     highest_prio_transitions,
@@ -49,62 +49,97 @@ def learner_process_fn(
     SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(
         {
             layout_version: {
-                # "eval_agg_ratio": [
-                #     "Multiline",
-                #     [
-                #         "eval_agg_ratio_trained_author",
-                #         "eval_agg_ratio_blind_author",
-                #     ],
-                # ],
-                # "eval_ratio_trained_author": [
-                #     "Multiline",
-                #     [
-                #         "eval_ratio_trained_author",
-                #     ],
-                # ],
-                # "eval_ratio_blind_author": [
-                #     "Multiline",
-                #     [
-                #         "eval_ratio_blind_author",
-                #     ],
-                # ],
-                "eval_race_time_robust": [
-                    "Multiline",
-                    [
-                        "eval_race_time_robust",
-                    ],
-                ],
-                "explo_race_time_finished": [
-                    "Multiline",
-                    [
-                        "explo_race_time_finished",
-                    ],
-                ],
-                "loss": ["Multiline", ["loss$", "loss_test$"]],
-                "avg_Q": [
-                    "Multiline",
-                    ["avg_Q"],
-                ],
-                "single_zone_reached": [
-                    "Multiline",
-                    [
-                        "single_zone_reached",
-                    ],
-                ],
-                "grad_norm_history": [
-                    "Multiline",
-                    [
-                        "grad_norm_history_d9",
-                        "grad_norm_history_d98",
-                    ],
-                ],
-                "priorities": [
-                    "Multiline",
-                    [
-                        "priorities",
-                    ],
-                ],
-            },
+        "eval_race_time_finished": [
+            "Multiline",
+            [
+                "eval_race_time_finished",
+            ],
+        ],
+        "explo_race_time_finished": [
+            "Multiline",
+            [
+                "explo_race_time_finished",
+            ],
+        ],
+        "loss_Q": ["Multiline", ["loss_Q$", "loss_Q_test$"]],
+        "loss_policy": ["Multiline", ["loss_policy$", "loss_policy_test$"]],
+        "loss_alpha": ["Multiline", ["loss_alpha$", "loss_alpha_test$"]],
+        "values_starting_frame": [
+            "Multiline",
+            [f"q_value_starting_frame_{i}" for i in range(len(config_copy.inputs))],
+        ],
+        "policy_starting_frame": [
+            "Multiline",
+            [f"policy_{i}_starting_frame" for i in range(len(config_copy.inputs))],
+        ],
+        "single_zone_reached": [
+            "Multiline",
+            [
+                "single_zone_reached",
+            ],
+        ],
+        r"races_finished": ["Multiline", ["explo_race_finished", "eval_race_finished"]],
+        "iqn_std": [
+            "Multiline",
+            [f"std_within_iqn_quantiles_for_action{i}" for i in range(len(config_copy.inputs))],
+        ],
+        "race_time_ratio": ["Multiline", ["race_time_ratio"]],
+        "mean_action_gap": [
+            "Multiline",
+            [
+                "mean_action_gap",
+            ],
+        ],
+        "layer_L2": [
+            "Multiline",
+            [
+                "layer_.*_L2",
+            ],
+        ],
+        "lr_ratio_L2": [
+            "Multiline",
+            [
+                "lr_ratio_.*_L2",
+            ],
+        ],
+        "exp_avg_L2": [
+            "Multiline",
+            [
+                "exp_avg_.*_L2",
+            ],
+        ],
+        "exp_avg_sq_L2": [
+            "Multiline",
+            [
+                "exp_avg_sq_.*_L2",
+            ],
+        ],
+        "eval_race_time": [
+            "Multiline",
+            [
+                "eval_race_time_[^_]*",
+            ],
+        ],
+        "explo_race_time": [
+            "Multiline",
+            [
+                "explo_race_time_[^_]*",
+            ],
+        ],
+        "sac_alpha": [
+            "Multiline",
+            [
+                "sac_alpha",
+            ],
+        ],
+        "policy_entropy": [
+            "Multiline",
+            [
+                "policy_entropy",
+                "policy_entropy",
+            ],
+        ],
+    },
         }
     )
 
@@ -112,11 +147,14 @@ def learner_process_fn(
     # Create new stuff
     # ========================================================
 
-    online_network, uncompiled_online_network = make_untrained_iqn_network(config_copy.use_jit, is_inference=False)
-    target_network, _ = make_untrained_iqn_network(config_copy.use_jit, is_inference=False)
+    soft_Q_model1, _ = iqn.make_untrained_SoftIQNQNetwork()
+    soft_Q_model2, _ = iqn.make_untrained_SoftIQNQNetwork()
+    policy_model, uncompiled_policy_model = iqn.make_untrained_PolicyNetwork()
+    logalpha_model, _ = iqn.make_untrained_LogAlphaSingletonNetwork()
 
-    print(online_network)
-    utilities.count_parameters(online_network)
+    print(soft_Q_model1)
+    print(policy_model)
+    print(logalpha_model)
 
     accumulated_stats: defaultdict[str, typing.Any] = defaultdict(int)
     accumulated_stats["alltime_min_ms"] = {}
@@ -134,14 +172,16 @@ def learner_process_fn(
     # ========================================================
     # noinspection PyBroadException
     try:
-        online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
-        print(" =====================     Learner weights loaded !     ============================")
+        soft_Q_model1.load_state_dict(torch.load(save_dir / "soft_Q_weights1.torch"))
+        soft_Q_model2.load_state_dict(torch.load(save_dir / "soft_Q_weights2.torch"))
+        policy_model.load_state_dict(torch.load(save_dir / "policy_weights.torch"))
+        logalpha_model.load_state_dict(torch.load(save_dir / "logalpha_weights.torch"))
+        print(" =========================     Weights loaded !     ================================")
     except:
-        print(" Learner could not load weights")
+        print(" Could not load weights")
 
     with shared_network_lock:
-        uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
+        uncompiled_shared_network.load_state_dict(uncompiled_policy_model.state_dict())
 
     # noinspection PyBroadException
     try:
@@ -160,25 +200,49 @@ def learner_process_fn(
     neural_net_reset_counter = 0
     single_reset_flag = config_copy.single_reset_flag
 
-    optimizer1 = torch.optim.RAdam(
-        online_network.parameters(),
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"]),
-        eps=config_copy.adam_epsilon,
-        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    )
-    # optimizer1 = torch_optimizer.Lookahead(optimizer1, k=5, alpha=0.5)
 
-    scaler = torch.amp.GradScaler("cuda")
+    soft_Q_optimizer = torch.optim.RAdam(
+            soft_Q_model1.parameters(),
+            lr=utilities.from_staircase_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"]),
+            eps=config_copy.adam_epsilon,
+            betas=(0.9, 0.95),
+        )
+    soft_Q_optimizer = torch_optimizer.Lookahead(soft_Q_optimizer, k=5, alpha=0.5)
+
+    policy_optimizer = torch.optim.RAdam(
+            policy_model.parameters(),
+            lr=utilities.from_staircase_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"]),
+            eps=config_copy.adam_epsilon,
+            betas=(0.9, 0.95),
+        )
+    policy_optimizer = torch_optimizer.Lookahead(policy_optimizer, k=5, alpha=0.5)
+
+    logalpha_optimizer = torch.optim.RAdam(
+        logalpha_model.parameters(),
+        lr=utilities.from_staircase_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_memories_generated"]),
+        eps=config_copy.adam_epsilon,
+        betas=(0.9, 0.95),
+    )
+
+    soft_Q_scaler = torch.amp.GradScaler("cuda")
+    policy_scaler = torch.amp.GradScaler("cuda")
+    logalpha_scaler = torch.amp.GradScaler("cuda")
+
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
+
     buffer, buffer_test = make_buffers(memory_size)
     offset_cumul_number_single_memories_used = memory_size_start_learn * config_copy.number_times_single_memory_is_used_before_discard
 
     # noinspection PyBroadException
     try:
-        optimizer1.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
-        scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
+        soft_Q_optimizer.load_state_dict(torch.load(save_dir / "soft_Q_optimizer.torch"))
+        soft_Q_scaler.load_state_dict(torch.load(save_dir / "soft_Q_scaler.torch"))
+        policy_optimizer.load_state_dict(torch.load(save_dir / "policy_optimizer.torch"))
+        policy_scaler.load_state_dict(torch.load(save_dir / "policy_scaler.torch"))
+        # logalpha_optimizer.load_state_dict(torch.load(save_dir / "logalpha_optimizer.torch"))
+        # logalpha_scaler.load_state_dict(torch.load(save_dir / "logalpha_scaler.torch"))
         print(" =========================     Optimizer loaded !     ================================")
     except:
         print(" Could not load optimizer")
@@ -189,8 +253,14 @@ def learner_process_fn(
     )
     tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + tensorboard_suffix)))
 
-    loss_history = []
-    loss_test_history = []
+    loss_Q_history = []
+    loss_Q_test_history = []
+    loss_policy_history = []
+    loss_policy_test_history = []
+    loss_alpha_history = []
+    loss_alpha_test_history = []
+    policy_entropy_history = []
+    policy_entropy_test_history = []
     train_on_batch_duration_history = []
     grad_norm_history = []
     layer_grad_norm_history = defaultdict(list)
@@ -198,19 +268,30 @@ def learner_process_fn(
     # ========================================================
     # Make the trainer
     # ========================================================
-    trainer = iqn.Trainer(
-        online_network=online_network,
-        target_network=target_network,
-        optimizer=optimizer1,
-        scaler=scaler,
-        batch_size=config_copy.batch_size,
-        iqn_n=config_copy.iqn_n,
-    )
+    gamma = utilities.from_linear_schedule(config_copy.gamma_schedule,
+                                              accumulated_stats["cumul_number_memories_generated"])
 
-    inferer = iqn.Inferer(
-        inference_network=online_network,
+    trainer = iqn.Trainer(
+        soft_Q_model=soft_Q_model1,
+        soft_Q_model2=soft_Q_model2,
+        soft_Q_optimizer=soft_Q_optimizer,
+        soft_Q_scaler=soft_Q_scaler,
+        policy_model=policy_model,
+        policy_optimizer=policy_optimizer,
+        policy_scaler=policy_scaler,
+        logalpha_model=logalpha_model,
+        logalpha_optimizer=logalpha_optimizer,
+        logalpha_scaler=logalpha_scaler,
+        batch_size=config_copy.batch_size,
         iqn_k=config_copy.iqn_k,
-        tau_epsilon_boltzmann=config_copy.tau_epsilon_boltzmann,
+        iqn_n=config_copy.iqn_n,
+        iqn_kappa=config_copy.iqn_kappa,
+        gamma=utilities.from_linear_schedule(config_copy.gamma_schedule,
+                                              accumulated_stats["cumul_number_memories_generated"]),
+        truncation_amplitude=config_copy.truncation_amplitude,
+        target_entropy=config_copy.target_entropy,  # This parameter is typically set to dim(action_space)
+        epsilon=utilities.from_staircase_schedule(config_copy.epsilon_schedule,
+                                              accumulated_stats["cumul_number_memories_generated"]),
     )
 
     while True:  # Trainer loop
@@ -286,21 +367,24 @@ def learner_process_fn(
         #   RELOAD
         # ===============================================
 
-        for param_group in optimizer1.param_groups:
+        for param_group in soft_Q_optimizer.param_groups:
             param_group["lr"] = learning_rate
-            param_group["epsilon"] = config_copy.adam_epsilon
-            param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+        for param_group in policy_optimizer.param_groups:
+            param_group["lr"] = learning_rate * config_copy.lr_policy_ratio
+        for param_group in logalpha_optimizer.param_groups:
+            param_group["lr"] = learning_rate * config_copy.lr_alpha_ratio
 
         if isinstance(buffer._sampler, PrioritizedSampler):
             buffer._sampler._alpha = config_copy.prio_alpha
             buffer._sampler._beta = config_copy.prio_beta
             buffer._sampler._eps = config_copy.prio_epsilon
 
-        if config_copy.plot_race_time_left_curves and not is_explo and (loop_number // 5) % 17 == 0:
-            race_time_left_curves(rollout_results, inferer, save_dir, map_name)
-            tau_curves(rollout_results, inferer, save_dir, map_name)
-            distribution_curves(buffer, save_dir, online_network, target_network)
-            loss_distribution(buffer, save_dir, online_network, target_network)
+
+        # if config_copy.plot_race_time_left_curves and not is_explo and (loop_number // 5) % 17 == 0:
+        #     race_time_left_curves(rollout_results, inferer, save_dir, map_name)
+        #    tau_curves(rollout_results, inferer, save_dir, map_name)
+        #    distribution_curves(buffer, save_dir, online_network, target_network)
+        #    loss_distribution(buffer, save_dir, online_network, target_network)
             # patrick_curves(rollout_results, trainer, save_dir, map_name)
 
         accumulated_stats["cumul_number_frames_played"] += len(rollout_results["frames"])
@@ -428,8 +512,7 @@ def learner_process_fn(
             (
                 buffer,
                 buffer_test,
-                number_memories_added_train,
-                number_memories_added_test,
+                number_memories_added,
             ) = buffer_management.fill_buffer_from_rollout_with_n_steps_rule(
                 buffer,
                 buffer_test,
@@ -437,17 +520,13 @@ def learner_process_fn(
                 config_copy.n_steps,
                 gamma,
                 config_copy.discard_non_greedy_actions_in_nsteps,
-                engineered_speedslide_reward,
-                engineered_neoslide_reward,
-                engineered_kamikaze_reward,
-                engineered_close_to_vcp_reward,
+                config_copy.n_zone_centers_in_inputs
             )
 
-            accumulated_stats["cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
-            shared_steps.value = accumulated_stats["cumul_number_memories_generated"]
-            neural_net_reset_counter += number_memories_added_train
+            accumulated_stats["cumul_number_memories_generated"] += number_memories_added
+            accumulated_stats["reset_counter"] += number_memories_added
             accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
-                config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
+                    config_copy.number_times_single_memory_is_used_before_discard * number_memories_added
             )
             print(f" NMG={accumulated_stats['cumul_number_memories_generated']:<8}")
 
@@ -455,42 +534,44 @@ def learner_process_fn(
             #   PERIODIC RESET ?
             # ===============================================
 
-            if neural_net_reset_counter >= config_copy.reset_every_n_frames_generated or single_reset_flag != config_copy.single_reset_flag:
-                neural_net_reset_counter = 0
-                single_reset_flag = config_copy.single_reset_flag
-                accumulated_stats["cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
-
-                _, untrained_iqn_network = make_untrained_iqn_network(config_copy.use_jit, False)
-                utilities.soft_copy_param(online_network, untrained_iqn_network, config_copy.overall_reset_mul_factor)
-
-                with torch.no_grad():
-                    online_network.A_head[2].weight = utilities.linear_combination(
-                        online_network.A_head[2].weight,
-                        untrained_iqn_network.A_head[2].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.A_head[2].bias = utilities.linear_combination(
-                        online_network.A_head[2].bias,
-                        untrained_iqn_network.A_head[2].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.V_head[2].weight = utilities.linear_combination(
-                        online_network.V_head[2].weight,
-                        untrained_iqn_network.V_head[2].weight,
-                        config_copy.last_layer_reset_factor,
-                    )
-                    online_network.V_head[2].bias = utilities.linear_combination(
-                        online_network.V_head[2].bias,
-                        untrained_iqn_network.V_head[2].bias,
-                        config_copy.last_layer_reset_factor,
-                    )
+            # if neural_net_reset_counter >= config_copy.reset_every_n_frames_generated or single_reset_flag != config_copy.single_reset_flag:
+            #     neural_net_reset_counter = 0
+            #     single_reset_flag = config_copy.single_reset_flag
+            #     accumulated_stats["cumul_number_single_memories_should_have_been_used"] += config_copy.additional_transition_after_reset
+            #
+            #     _, untrained_iqn_network = make_untrained_iqn_network(config_copy.use_jit, False)
+            #     utilities.soft_copy_param(online_network, untrained_iqn_network, config_copy.overall_reset_mul_factor)
+            #
+            #     with torch.no_grad():
+            #         online_network.A_head[2].weight = utilities.linear_combination(
+            #             online_network.A_head[2].weight,
+            #             untrained_iqn_network.A_head[2].weight,
+            #             config_copy.last_layer_reset_factor,
+            #         )
+            #         online_network.A_head[2].bias = utilities.linear_combination(
+            #             online_network.A_head[2].bias,
+            #             untrained_iqn_network.A_head[2].bias,
+            #             config_copy.last_layer_reset_factor,
+            #         )
+            #         online_network.V_head[2].weight = utilities.linear_combination(
+            #             online_network.V_head[2].weight,
+            #             untrained_iqn_network.V_head[2].weight,
+            #             config_copy.last_layer_reset_factor,
+            #         )
+            #         online_network.V_head[2].bias = utilities.linear_combination(
+            #             online_network.V_head[2].bias,
+            #             untrained_iqn_network.V_head[2].bias,
+            #             config_copy.last_layer_reset_factor,
+            #         )
 
             # ===============================================
             #   LEARN ON BATCH
             # ===============================================
 
             if not online_network.training:
-                online_network.train()
+                soft_Q_model1.train()
+                policy_model.train()
+                logalpha_model.train()
 
             while (
                 len(buffer) >= memory_size_start_learn
@@ -498,47 +579,45 @@ def learner_process_fn(
                 <= accumulated_stats["cumul_number_single_memories_should_have_been_used"]
             ):
                 if (random.random() < config_copy.buffer_test_ratio and len(buffer_test) > 0) or len(buffer) == 0:
-                    test_start_time = time.perf_counter()
-                    loss, _ = trainer.train_on_batch(buffer_test, do_learn=False)
-                    time_testing_since_last_tensorboard_write += time.perf_counter() - test_start_time
-                    loss_test_history.append(loss)
-                    print(f"BT   {loss=:<8.2e}")
+                    loss_Q, loss_policy, loss_alpha, policy_entropy = trainer.train_on_batch(buffer_test, do_learn=False)
+                    loss_Q_test_history.append(loss_Q)
+                    loss_policy_test_history.append(loss_policy)
+                    loss_alpha_test_history.append(loss_alpha)
+                    policy_entropy_test_history.append(policy_entropy)
+                    print(f"BT   {loss_Q=:<8.2e} {loss_policy=:<8.2e} {loss_alpha=:<8.2e}")
                 else:
-                    train_start_time = time.perf_counter()
-                    loss, grad_norm = trainer.train_on_batch(buffer, do_learn=True)
-                    train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
-                    time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]
-                    accumulated_stats["cumul_number_single_memories_used"] += (
-                        4 * config_copy.batch_size
-                        if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
-                        else config_copy.batch_size
-                    )  # do fewer batches while memory is not full
-                    loss_history.append(loss)
-                    if not math.isinf(grad_norm):
-                        grad_norm_history.append(grad_norm)
-                        # utilities.log_gradient_norms(online_network, layer_grad_norm_history) #~1ms overhead per batch
+                    train_start_time = time.time()
+                    loss_Q, loss_policy, loss_alpha, policy_entropy = trainer.train_on_batch(buffer, do_learn=True)
+                    accumulated_stats["cumul_number_single_memories_used"] += config_copy.batch_size
+                    train_on_batch_duration_history.append(time.time() - train_start_time)
+                    loss_Q_history.append(loss_Q)
+                    loss_policy_history.append(loss_policy)
+                    loss_alpha_history.append(loss_alpha)
+                    policy_entropy_history.append(policy_entropy)
+
+                    # if not math.isinf(grad_norm):
+                    #     grad_norm_history.append(grad_norm)
+                    #     # utilities.log_gradient_norms(online_network, layer_grad_norm_history) #~1ms overhead per batch
 
                     accumulated_stats["cumul_number_batches_done"] += 1
-                    print(f"B    {loss=:<8.2e} {grad_norm=:<8.2e} {train_on_batch_duration_history[-1]*1000:<8.1f}")
+                    print(f"B    {loss_Q=:<8.2e} {loss_policy=:<8.2e} {loss_alpha=:<8.2e}")
 
-                    utilities.custom_weight_decay(online_network, 1 - weight_decay)
-                    if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
-                        with shared_network_lock:
-                            uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
+                    utilities.custom_weight_decay(soft_Q_model1, 1 - weight_decay)
+                    utilities.custom_weight_decay(policy_model, 1 - weight_decay)
 
                     # ===============================================
                     #   UPDATE TARGET NETWORK
                     # ===============================================
                     if (
-                        accumulated_stats["cumul_number_single_memories_used"]
-                        >= accumulated_stats["cumul_number_single_memories_used_next_target_network_update"]
+                            accumulated_stats["cumul_number_single_memories_used"]
+                            >= accumulated_stats["cumul_number_single_memories_used_next_target_network_update"]
                     ):
                         accumulated_stats["cumul_number_target_network_updates"] += 1
-                        accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] += (
-                            config_copy.number_memories_trained_on_between_target_network_updates
-                        )
-                        # print("UPDATE")
-                        utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
+                        accumulated_stats[
+                            "cumul_number_single_memories_used_next_target_network_update"
+                        ] += config_copy.number_memories_trained_on_between_target_network_updates
+                        print("UPDATE")
+                        utilities.soft_copy_param(soft_Q_model2, soft_Q_model1, config_copy.soft_update_tau)
             sys.stdout.flush()
 
         # ===============================================
@@ -636,9 +715,10 @@ def learner_process_fn(
             if online_network.training:
                 online_network.eval()
             tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
-            per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
-            for i, std in enumerate(list(per_quantile_output.std(axis=0))):
-                step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std
+
+            # per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
+            # for i, std in enumerate(list(per_quantile_output.std(axis=0))):
+            #     step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std
 
             # ===============================================
             #   WRITE TO TENSORBOARD

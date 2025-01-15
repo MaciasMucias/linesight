@@ -1,38 +1,26 @@
-"""
-In this file, we define:
-    - The IQN_Network class, which defines the neural network's structure.
-    - The Trainer class, which implements the IQN training logic in method train_on_batch.
-    - The Inferer class, which implements utilities for forward propagation with and without exploration.
-"""
-
-import copy
 import math
 import random
+from collections import deque
 from typing import Optional, Tuple
 
 import numpy as np
-import numpy.typing as npt
 import torch
+from torch.distributions import Categorical
 from torchrl.data import ReplayBuffer
 
-from config_files import config_copy
+from config_files import config_copy  # TODO virer cet import
 from trackmania_rl import utilities
 
 
-class IQN_Network(torch.nn.Module):
+class FeatureExtractor(torch.nn.Module):
     def __init__(
         self,
-        float_inputs_dim: int,
-        float_hidden_dim: int,
-        conv_head_output_dim: int,
-        dense_hidden_dimension: int,
-        iqn_embedding_dimension: int,
-        n_actions: int,
-        float_inputs_mean: npt.NDArray,
-        float_inputs_std: npt.NDArray,
+        float_inputs_dim,
+        float_hidden_dim,
+        float_inputs_mean,
+        float_inputs_std,
     ):
         super().__init__()
-        self.iqn_embedding_dimension = iqn_embedding_dimension
         img_head_channels = [1, 16, 32, 64, 32]
         activation_function = torch.nn.LeakyReLU
         self.img_head = torch.nn.Sequential(
@@ -52,7 +40,82 @@ class IQN_Network(torch.nn.Module):
             torch.nn.Linear(float_hidden_dim, float_hidden_dim),
             activation_function(inplace=True),
         )
+        self.float_inputs_mean = torch.tensor(float_inputs_mean, dtype=torch.float32).to("cuda")
+        self.float_inputs_std = torch.tensor(float_inputs_std, dtype=torch.float32).to("cuda")
 
+    def initialize_weights(self):
+        lrelu_neg_slope = 1e-2
+        lrelu_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
+        for m in self.img_head:
+            if isinstance(m, torch.nn.Conv2d):
+                utilities.init_orthogonal(m, lrelu_gain)
+        for m in self.float_feature_extractor:
+            if isinstance(m, torch.nn.Linear):
+                utilities.init_orthogonal(m, lrelu_gain)
+
+    def forward(self, img, float_inputs, use_fp32: bool = False) -> torch.Tensor:
+        img_outputs = self.img_head((img.to(torch.float32 if use_fp32 else torch.float16) - 128) / 128)  # PERF
+        # img_outputs = torch.zeros(batch_size, config_copy.conv_head_output_dim).to(device="cuda") # Uncomment to temporarily mask the img_head
+        float_outputs = self.float_feature_extractor((float_inputs - self.float_inputs_mean) / self.float_inputs_std)
+        # (batch_size, dense_input_dimension) OK
+        return torch.cat((img_outputs, float_outputs), 1)
+
+
+class LogPolicyNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        float_inputs_dim,
+        float_hidden_dim,
+        conv_head_output_dim,
+        dense_hidden_dimension,
+        n_actions,
+        float_inputs_mean,
+        float_inputs_std,
+    ):
+        super().__init__()
+        self.feature_extractor = FeatureExtractor(float_inputs_dim, float_hidden_dim, float_inputs_mean, float_inputs_std)
+        activation_function = torch.nn.LeakyReLU
+        dense_input_dimension = conv_head_output_dim + float_hidden_dim
+        self.policy_head = torch.nn.Sequential(
+            torch.nn.Linear(dense_input_dimension, dense_hidden_dimension // 2),
+            activation_function(inplace=True),
+            torch.nn.Linear(dense_hidden_dimension // 2, n_actions),
+            torch.nn.LogSoftmax(dim=-1),
+        )
+        self.n_actions = n_actions
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        lrelu_neg_slope = 1e-2
+        lrelu_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
+        for m in self.policy_head:
+            if isinstance(m, torch.nn.Linear):
+                utilities.init_orthogonal(m, lrelu_gain)
+        self.feature_extractor.initialize_weights()
+
+    def forward(self, img, float_inputs, use_fp32: bool = False) -> torch.Tensor:
+        concat = self.feature_extractor(img, float_inputs, use_fp32)
+        return torch.clamp(
+            self.policy_head(concat), min=-23.0
+        )  # If the policy goes below 1e-10, we clamp it to 1e-10. Since we return the log policy, the clamp is -23
+
+
+class SoftIQNQNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        float_inputs_dim,
+        float_hidden_dim,
+        conv_head_output_dim,
+        dense_hidden_dimension,
+        iqn_embedding_dimension,
+        n_actions,
+        float_inputs_mean,
+        float_inputs_std,
+    ):
+        super().__init__()
+        self.iqn_embedding_dimension = iqn_embedding_dimension
+        self.feature_extractor = FeatureExtractor(float_inputs_dim, float_hidden_dim, float_inputs_mean, float_inputs_std)
+        activation_function = torch.nn.LeakyReLU
         dense_input_dimension = conv_head_output_dim + float_hidden_dim
 
         self.A_head = torch.nn.Sequential(
@@ -65,67 +128,43 @@ class IQN_Network(torch.nn.Module):
             activation_function(inplace=True),
             torch.nn.Linear(dense_hidden_dimension // 2, 1),
         )
-        self.iqn_fc = torch.nn.Sequential(torch.nn.Linear(iqn_embedding_dimension, dense_input_dimension), torch.nn.LeakyReLU(inplace=True))
+
+        self.iqn_fc = torch.nn.Linear(
+            iqn_embedding_dimension, dense_input_dimension
+        )  # There is no word in the paper on how to init this layer?
+        self.lrelu = torch.nn.LeakyReLU()
         self.initialize_weights()
 
         self.n_actions = n_actions
 
-        # States are not normalized when the method forward() is called. Normalization is done as the first step of the forward() method.
         self.float_inputs_mean = torch.tensor(float_inputs_mean, dtype=torch.float32).to("cuda")
         self.float_inputs_std = torch.tensor(float_inputs_std, dtype=torch.float32).to("cuda")
 
     def initialize_weights(self):
         lrelu_neg_slope = 1e-2
-        activation_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
-        for module in [self.img_head, self.float_feature_extractor, self.A_head[:-1], self.V_head[:-1]]:
-            for m in module:
-                if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
-                    utilities.init_orthogonal(m, activation_gain)
+        lrelu_gain = torch.nn.init.calculate_gain("leaky_relu", lrelu_neg_slope)
         utilities.init_orthogonal(
-            self.iqn_fc[0], np.sqrt(2) * activation_gain
+            self.iqn_fc, np.sqrt(2) * lrelu_gain
         )  # Since cosine has a variance of 1/2, and we would like to exit iqn_fc with a variance of 1, we need a weight variance double that of what a normal leaky relu would need
-        for module in [self.A_head[-1], self.V_head[-1]]:
-            utilities.init_orthogonal(module)
+        for m in self.A_head[:-1]:
+            if isinstance(m, torch.nn.Linear):
+                utilities.init_orthogonal(m, lrelu_gain)
+        utilities.init_orthogonal(self.A_head[-1])
+        for m in self.V_head[:-1]:
+            if isinstance(m, torch.nn.Linear):
+                utilities.init_orthogonal(m, lrelu_gain)
+        utilities.init_orthogonal(self.V_head[-1])
+        self.feature_extractor.initialize_weights()
 
     def forward(
-        self, img: torch.Tensor, float_inputs: torch.Tensor, num_quantiles: int, tau: Optional[torch.Tensor] = None
+        self, img, float_inputs, num_quantiles: int, tau: Optional[torch.Tensor] = None, use_fp32: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        This method implements the forward pass through the IQN neural network.
-
-        The neural network is structured with two input heads:
-            - one for images, with Conv2D layers
-            - one for float features with Dense layers
-
-        The embedding extracted by these two input heads are concatenated, mixed (Hadamard product) with an embedding for IQN quantiles.
-
-        A dueling network architecture (https://arxiv.org/abs/1511.06581) is implemented, two output heads predict:
-            - the value of a (state, quantile) pair
-            - the advantage of a (state, action, quantile) triplet
-
-        The Value and Advantage heads are combined to return the Q values directly.
-
-        Args:
-            img: a torch.Tensor of shape (batch_size, 1, H, W) and type float16 or float32, depending on context.
-            float_inputs: a torch.Tensor of shape (batch_size, float_input_dim) and type float16 or float32, depending on context.
-            num_quantiles: the number of quantiles, defined as N or N' in the IQN paper (https://arxiv.org/pdf/1806.06923).
-            tau: if not None, a torch.Tensor of shape (batch_size * num_quantiles) the specifies the exact quantiles for which the neural network should return Q values
-                 if None, the method will sample tau randomly in num_quantiles regularly spaced segments, and symmetrically around 0.5.
-
-        Returns:
-            Q: a torch.Tensor of shape (batch_size * num_quantiles, 1) representing the Q values for a given (state, quantile) combination
-            tau: a torch.Tensor of shape (batch_size * num_quantiles, 1) representing the quantiles used to make each prediction
-        """
         batch_size = img.shape[0]
-        img_outputs = self.img_head(img)
-        float_outputs = self.float_feature_extractor((float_inputs - self.float_inputs_mean) / self.float_inputs_std)
-        concat = torch.cat((img_outputs, float_outputs), 1)  # (batch_size, dense_input_dimension)
+        concat = self.feature_extractor(img, float_inputs, use_fp32)
         if tau is None:
-            tau = (
-                torch.arange(num_quantiles // 2, device="cuda", dtype=torch.float32).repeat_interleave(batch_size).unsqueeze(1)
-                + torch.rand(size=(batch_size * num_quantiles // 2, 1), device="cuda", dtype=torch.float32)
-            ) / num_quantiles  # (batch_size * num_quantiles // 2, 1) (random numbers)
-            tau = torch.cat((tau, 1 - tau), dim=0)  # ensure that tau are sampled symmetrically
+            tau = torch.rand(
+                size=(batch_size * num_quantiles, 1), device="cuda", dtype=torch.float32
+            )  # (batch_size * num_quantiles, 1) (random numbers)
         quantile_net = torch.cos(
             torch.arange(1, self.iqn_embedding_dimension + 1, 1, device="cuda") * math.pi * tau
         )  # (batch_size*num_quantiles, 1)
@@ -136,100 +175,108 @@ class IQN_Network(torch.nn.Module):
         # (batch_size*num_quantiles, dense_input_dimension)
         quantile_net = self.iqn_fc(quantile_net)
         # (batch_size*num_quantiles, dense_input_dimension)
+        quantile_net = self.lrelu(quantile_net)
+        # (batch_size*num_quantiles, dense_input_dimension)
         concat = concat.repeat(num_quantiles, 1)
         # (batch_size*num_quantiles, dense_input_dimension)
         concat = concat * quantile_net
 
         A = self.A_head(concat)  # (batch_size*num_quantiles, n_actions)
-        V = self.V_head(concat)  # (batch_size*num_quantiles, 1)
+        V = self.V_head(concat)  # (batch_size*num_quantiles, 1) #need to check this
 
-        Q = V + A - A.mean(dim=-1).unsqueeze(-1)
-
-        return Q, tau
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        return self
+        soft_Q = V + A - A.mean(dim=-1).unsqueeze(-1)
+        return soft_Q, tau
 
 
-@torch.compile(disable=not config_copy.is_linux, dynamic=False)
-def iqn_loss(targets: torch.Tensor, outputs: torch.Tensor, tau_outputs: torch.Tensor, num_quantiles: int, batch_size: int):
-    """
-    Implements the IQN loss as defined in the IQN paper (https://arxiv.org/pdf/1806.06923)
+class LogAlphaSingletonNetwork(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # We optimize log(alpha), instead of alpha.
+        self.log_alpha = torch.nn.parameter.Parameter(torch.ones(1, requires_grad=True) * np.log(config_copy.sac_alpha))
 
-    Args:
-        targets: a torch.Tensor of shape (batch_size, num_quantiles, 1)
-        outputs: a torch.Tensor of shape (batch_size, num_quantiles, 1)
-        tau_outputs: a torch.Tensor of shape (batch_size * num_quantiles, 1)
-        num_quantiles: (int)
-        batch_size: (int)
+    def forward(self) -> torch.Tensor:
+        return self.log_alpha
 
-    Returns:
-        loss: a torch.Tensor of shape (batch_size, )
-    """
-    TD_error = targets[:, :, None, :] - outputs[:, None, :, :]
-    # (batch_size, iqn_n, iqn_n, 1)
-    loss = torch.where(
-        torch.lt(torch.abs(TD_error), config_copy.iqn_kappa),
-        (0.5 / config_copy.iqn_kappa) * TD_error**2,
-        (torch.abs(TD_error) - 0.5 * config_copy.iqn_kappa),
-    )
-    tau = tau_outputs.reshape([num_quantiles, batch_size, 1]).transpose(0, 1)  # (batch_size, iqn_n, 1)
-    tau = tau[:, None, :, :].expand([-1, num_quantiles, -1, -1])  # (batch_size, iqn_n, iqn_n, 1)
-    loss = (torch.where(torch.lt(TD_error, 0), 1 - tau, tau) * loss).sum(dim=2).mean(dim=1)[:, 0]  # pinball loss # (batch_size, )
-    return loss
+
+# ==========================================================================================================================
 
 
 class Trainer:
     __slots__ = (
-        "online_network",
-        "target_network",
-        "optimizer",
-        "scaler",
+        "soft_Q_model",
+        "soft_Q_model2",
+        "soft_Q_optimizer",
+        "soft_Q_scaler",
+        "policy_model",
+        "policy_optimizer",
+        "policy_scaler",
+        "logalpha_model",
+        "logalpha_optimizer",
+        "logalpha_scaler",
         "batch_size",
+        "iqn_k",
         "iqn_n",
-        "typical_self_loss",
-        "typical_clamped_self_loss",
+        "iqn_kappa",
+        "gamma",
+        "IS_average",
+        "truncation_amplitude",
+        "target_entropy",
+        "epsilon",
     )
 
     def __init__(
         self,
-        online_network: IQN_Network,
-        target_network: IQN_Network,
-        optimizer: torch.optim.Optimizer,
-        scaler: torch.amp.GradScaler,
+        soft_Q_model: SoftIQNQNetwork,
+        soft_Q_model2: SoftIQNQNetwork,
+        soft_Q_optimizer: torch.optim.Optimizer,
+        soft_Q_scaler: torch.cuda.amp.grad_scaler.GradScaler,
+        policy_model: LogPolicyNetwork,
+        policy_optimizer: torch.optim.Optimizer,
+        policy_scaler: torch.cuda.amp.grad_scaler.GradScaler,
+        logalpha_model: LogAlphaSingletonNetwork,
+        logalpha_optimizer: torch.optim.Optimizer,
+        logalpha_scaler: torch.cuda.amp.grad_scaler.GradScaler,
         batch_size: int,
+        iqn_k: int,
         iqn_n: int,
+        iqn_kappa: float,
+        gamma: float,
+        truncation_amplitude: float,
+        target_entropy: float,  # This parameter is typically set to dim(action_space)
+        epsilon: float,
     ):
-        self.online_network = online_network
-        self.target_network = target_network
-        self.optimizer = optimizer
-        self.scaler = scaler
+        self.soft_Q_model = soft_Q_model
+        self.soft_Q_model2 = soft_Q_model2
+        self.soft_Q_optimizer = soft_Q_optimizer
+        self.soft_Q_scaler = soft_Q_scaler
+
+        self.policy_model = policy_model
+        self.policy_optimizer = policy_optimizer
+        self.policy_scaler = policy_scaler
+
+        self.logalpha_model = logalpha_model
+        self.logalpha_optimizer = logalpha_optimizer
+        self.logalpha_scaler = logalpha_scaler
+
         self.batch_size = batch_size
+        self.iqn_k = iqn_k
         self.iqn_n = iqn_n
-        self.typical_self_loss = 0.01
-        self.typical_clamped_self_loss = 0.01
+        self.iqn_kappa = iqn_kappa
+
+        self.gamma = gamma
+        self.IS_average = deque([], maxlen=100)
+        self.truncation_amplitude = truncation_amplitude
+        self.target_entropy = target_entropy
+
+        self.epsilon = epsilon
 
     def train_on_batch(self, buffer: ReplayBuffer, do_learn: bool):
-        """
-        Implements one iteration of the training loop:
-            1) Sample a batch of transitions from the replay buffer
-            2) Calculate the IQN loss
-            3) Obtain gradients through backpropagation
-            4) Update the neural network weights using the optimizer
+        self.soft_Q_optimizer.zero_grad(set_to_none=True)
+        self.policy_optimizer.zero_grad(set_to_none=True)
+        self.logalpha_optimizer.zero_grad(set_to_none=True)
 
-        The training loop may be configured to use DDQN-style updates with config.use_ddqn.
-
-        Args:
-            buffer: a ReplayBuffer object from which transitions are sampled. Currently, handles a basic buffer or a prioritized replay buffer.
-            do_learn: a boolean indicating whether steps 3 and 4 should be applied. If these are not applied, the method only returns total_loss and grad_norm for logging purposes.
-
-        Returns:
-            total_loss: a float
-            grad_norm: a float
-
-        """
-        self.optimizer.zero_grad(set_to_none=True)
+        sac_alpha = self.logalpha_model().exp().item()
+        # sac_alpha = config_copy.sac_alpha  # TODO temporary test
 
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
             with torch.no_grad():
@@ -237,53 +284,84 @@ class Trainer:
                 (
                     state_img_tensor,
                     state_float_tensor,
-                    actions,
-                    rewards,
+                    new_actions,
+                    new_n_steps,
+                    rewards_per_n_steps,
                     next_state_img_tensor,
                     next_state_float_tensor,
-                    gammas_terminal,
+                    gammas_per_n_steps,
+                    minirace_min_time_actions,
                 ) = batch
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.no_grad():
                 if config_copy.prio_alpha > 0:
-                    IS_weights = torch.from_numpy(batch_info["_weight"]).to("cuda", non_blocking=True)
+                    self.IS_average.append(batch_info["_weight"].mean())
+                    IS_weights = torch.from_numpy(batch_info["_weight"] / np.mean(self.IS_average)).to("cuda", non_blocking=True)
+                new_actions = new_actions.to(dtype=torch.int64)
+                new_n_steps = new_n_steps.to(dtype=torch.int64)
+                minirace_min_time_actions = minirace_min_time_actions.to(dtype=torch.int64)
 
-                rewards = rewards.unsqueeze(-1).repeat(
+                new_xxx = (
+                    torch.rand(size=minirace_min_time_actions.shape, device="cuda")
+                    * (config_copy.temporal_mini_race_duration_actions - minirace_min_time_actions)
+                ).to(dtype=torch.int64)
+                temporal_mini_race_current_time_actions = config_copy.temporal_mini_race_duration_actions - 1 - new_xxx
+                temporal_mini_race_next_time_actions = temporal_mini_race_current_time_actions + new_n_steps
+
+                state_float_tensor[:, 0] = temporal_mini_race_current_time_actions
+                next_state_float_tensor[:, 0] = temporal_mini_race_next_time_actions
+
+                new_done = temporal_mini_race_next_time_actions >= config_copy.temporal_mini_race_duration_actions
+                possibly_reduced_n_steps = (
+                    new_n_steps - (temporal_mini_race_next_time_actions - config_copy.temporal_mini_race_duration_actions).clip(min=0)
+                ).to(dtype=torch.int64)
+
+                rewards = rewards_per_n_steps.gather(1, (possibly_reduced_n_steps - 1).unsqueeze(-1)).repeat(
                     [self.iqn_n, 1]
-                )  # (batch_size*iqn_n, 1)     a,b,c,d becomes a,b,c,d,a,b,c,d,a,b,c,d,... (iqn_n times)
-                gammas_terminal = gammas_terminal.unsqueeze(-1).repeat([self.iqn_n, 1])  # (batch_size*iqn_n, 1)
-                actions = actions.unsqueeze(-1).repeat([self.iqn_n, 1])  # (batch_size*iqn_n, 1)
+                )  # (batch_size*iqn_n, 1)     a,b,c,d devient a,b,c,d,a,b,c,d,a,b,c,d,...
+                # (batch_size*iqn_n, 1)
+                gammas_pow_nsteps = gammas_per_n_steps.gather(1, (possibly_reduced_n_steps - 1).unsqueeze(-1)).repeat([self.iqn_n, 1])
+                done = new_done.reshape(-1, 1).repeat([self.iqn_n, 1])  # (batch_size*iqn_n, 1)
+                actions = new_actions[:, None]  # (batch_size, 1)
+                actions_n = actions.repeat([self.iqn_n, 1])  # (batch_size*iqn_n, 1)
+
                 #
-                #   Use target_network to evaluate the action chosen, per quantile.
+                #   Use policy_model
                 #
-                q__stpo__target__quantiles_tau2, tau2 = self.target_network(
-                    next_state_img_tensor, next_state_float_tensor, self.iqn_n, tau=None
-                )  # (batch_size*iqn_n, n_actions)
+                log_pi_stpo = self.policy_model(next_state_img_tensor, next_state_float_tensor)
+
+                """
+                If we want to "truncate" the target distribution as in TQC, this is where we would do it. Force tau2 to be sampled for [0 ; 0.9 [ instead of [0 ; 1 [ for example.
+                """
                 #
-                #   Use online network to choose an action for next state.
+                #   Use model2 to evaluate the action chosen, per quantile.
+                #
+                tau2 = (
+                    torch.rand(size=(config_copy.batch_size * self.iqn_n, 1), device="cuda", dtype=torch.float32) * self.truncation_amplitude
+                )  # (batch_size * num_quantiles, 1) (random numbers)
+
+                q__stpo__model2__quantiles_tau2, _ = self.soft_Q_model2(
+                    next_state_img_tensor, next_state_float_tensor, self.iqn_n, tau=tau2
+                )  # (batch_size*iqn_n,n_actions)
+
+                #
+                #   Use model to choose an action for next state.
                 #   This action is chosen AFTER reduction to the mean, and repeated to all quantiles
                 #
-                if config_copy.use_ddqn:
-                    a__tpo__online__reduced_repeated = (
-                        self.online_network(
-                            next_state_img_tensor,
-                            next_state_float_tensor,
-                            self.iqn_n,
-                            tau=None,
-                        )[0]
-                        .reshape([self.iqn_n, self.batch_size, self.online_network.n_actions])
-                        .mean(dim=0)
-                        .argmax(dim=1, keepdim=True)
-                        .repeat([self.iqn_n, 1])
-                    )  # (iqn_n * batch_size, 1)
-                    #
-                    #   Build IQN target on tau2 quantiles
-                    #
-                    outputs_target_tau2 = rewards + gammas_terminal * q__stpo__target__quantiles_tau2.gather(
-                        1, a__tpo__online__reduced_repeated
-                    )  # (batch_size*iqn_n, 1)
-                else:
-                    outputs_target_tau2 = (
-                        rewards + gammas_terminal * q__stpo__target__quantiles_tau2.max(dim=1, keepdim=True)[0]
-                    )  # (batch_size*iqn_n, 1)
+                target = rewards + gammas_pow_nsteps * (
+                    (q__stpo__model2__quantiles_tau2 - (sac_alpha * log_pi_stpo).repeat(self.iqn_n, 1))
+                    * log_pi_stpo.exp().repeat(self.iqn_n, 1)
+                ).sum(dim=1, keepdim=True)
+                # (batch_size*iqn_n, 1)
+
+                #
+                #   Build IQN target on tau2 quantiles
+                #
+                outputs_target_tau2 = torch.where(
+                    done,
+                    rewards,
+                    target,
+                )  # (batch_size*iqn_n, 1)
 
                 #
                 #   This is our target
@@ -291,164 +369,124 @@ class Trainer:
                 outputs_target_tau2 = outputs_target_tau2.reshape([self.iqn_n, self.batch_size, 1]).transpose(
                     0, 1
                 )  # (batch_size, iqn_n, 1)
-
-            q__st__online__quantiles_tau3, tau3 = self.online_network(
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            q__st__model__quantiles_tau3, tau3 = self.soft_Q_model(
                 state_img_tensor, state_float_tensor, self.iqn_n, tau=None
             )  # (batch_size*iqn_n,n_actions)
+
             outputs_tau3 = (
-                q__st__online__quantiles_tau3.gather(1, actions).reshape([self.iqn_n, self.batch_size, 1]).transpose(0, 1)
+                q__st__model__quantiles_tau3.gather(1, actions_n).reshape([self.iqn_n, self.batch_size, 1]).transpose(0, 1)
             )  # (batch_size, iqn_n, 1)
 
-            loss = iqn_loss(outputs_target_tau2, outputs_tau3, tau3, config_copy.iqn_n, config_copy.batch_size)
-
-            target_self_loss = torch.sqrt(
-                iqn_loss(
-                    outputs_target_tau2.detach(), outputs_target_tau2.detach(), tau2.detach(), config_copy.iqn_n, config_copy.batch_size
-                )
+            TD_error = outputs_target_tau2[:, :, None, :] - outputs_tau3[:, None, :, :]
+            # (batch_size, iqn_n, iqn_n, 1)    WTF ????????
+            # Huber loss, my alternative
+            loss_Q_network = torch.where(
+                torch.abs(TD_error) <= self.iqn_kappa,
+                0.5 * TD_error**2,
+                self.iqn_kappa * (torch.abs(TD_error) - 0.5 * self.iqn_kappa),
             )
+            tau3 = tau3.reshape([self.iqn_n, self.batch_size, 1]).transpose(0, 1)  # (batch_size, iqn_n, 1)
+            tau3 = tau3[:, None, :, :].expand([-1, self.iqn_n, -1, -1])  # (batch_size, iqn_n, iqn_n, 1)
+            loss_Q_network = (
+                (torch.where(TD_error < 0, 1 - tau3, tau3) * loss_Q_network / self.iqn_kappa).sum(dim=2).mean(dim=1)[:, 0]
+            )  # pinball loss # (batch_size, )
 
-            self.typical_self_loss = 0.99 * self.typical_self_loss + 0.01 * target_self_loss.mean()
+            total_loss_Q_network = torch.sum(IS_weights * loss_Q_network if config_copy.prio_alpha > 0 else loss_Q_network)
 
-            correction_clamped = target_self_loss.clamp(min=self.typical_self_loss / config_copy.target_self_loss_clamp_ratio)
+            # ===============================
+            log_pi_st = self.policy_model(state_img_tensor, state_float_tensor)  # (batch_size, n_actions)
+            pi_st = log_pi_st.exp()
+            q__st__model__averaged_over_quantiles = q__st__model__quantiles_tau3.reshape(
+                [self.iqn_n, self.batch_size, self.soft_Q_model.n_actions]
+            ).mean(
+                dim=0
+            )  # (batch_size, n_actions)
+            loss_policy = ((sac_alpha * log_pi_st - q__st__model__averaged_over_quantiles) * pi_st).sum(axis=1)  # (batch_size, )
+            total_loss_policy = torch.sum(IS_weights * loss_policy if config_copy.prio_alpha > 0 else loss_policy)
+            # ===============================
 
-            self.typical_clamped_self_loss = 0.99 * self.typical_clamped_self_loss + 0.01 * correction_clamped.mean()
-
-            loss *= self.typical_clamped_self_loss / correction_clamped
-
-            total_loss = torch.sum(IS_weights * loss if config_copy.prio_alpha > 0 else loss)
+            # Apparently optimizing the log of alpha instead of alpha is standard
+            policy_entropy = -(pi_st.detach() * log_pi_st.detach()).sum(axis=1)
+            loss_entropy = -self.logalpha_model() * (-policy_entropy + self.target_entropy)  # (batch_size, )
+            total_loss_entropy = torch.sum(IS_weights * loss_entropy if config_copy.prio_alpha > 0 else loss_entropy)
+            # ===============================
 
             if do_learn:
-                self.scaler.scale(total_loss).backward()
-
+                self.soft_Q_scaler.scale(total_loss_Q_network).backward(retain_graph=True)
                 # Gradient clipping : https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = (
-                    torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), config_copy.clip_grad_norm).detach().cpu().item()
-                )
-                torch.nn.utils.clip_grad_value_(self.online_network.parameters(), config_copy.clip_grad_value)
+                self.soft_Q_scaler.unscale_(self.soft_Q_optimizer)
+                _ = torch.nn.utils.clip_grad_norm_(self.soft_Q_model.parameters(), config_copy.clip_grad_norm).detach().cpu().item()
+                torch.nn.utils.clip_grad_value_(self.soft_Q_model.parameters(), config_copy.clip_grad_value)
+                self.soft_Q_scaler.step(self.soft_Q_optimizer)
+                self.soft_Q_scaler.update()
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                grad_norm = 0
+                self.policy_scaler.scale(total_loss_policy).backward()
+                # Gradient clipping : https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
+                self.policy_scaler.unscale_(self.policy_optimizer)
+                _ = torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), config_copy.clip_grad_norm).detach().cpu().item()
+                torch.nn.utils.clip_grad_value_(self.policy_model.parameters(), config_copy.clip_grad_value)
+                self.policy_scaler.step(self.policy_optimizer)
+                self.policy_scaler.update()
 
-            total_loss = total_loss.detach().cpu()
+                self.logalpha_scaler.scale(total_loss_entropy).backward()
+                # Gradient clipping : https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
+                self.logalpha_scaler.unscale_(self.logalpha_optimizer)
+                _ = torch.nn.utils.clip_grad_norm_(self.logalpha_model.parameters(), config_copy.clip_grad_norm).detach().cpu().item()
+                torch.nn.utils.clip_grad_value_(self.logalpha_model.parameters(), config_copy.clip_grad_value)
+                self.logalpha_scaler.step(self.logalpha_optimizer)
+                self.logalpha_scaler.update()
+
+            total_loss_Q_network = total_loss_Q_network.detach().cpu()
+            total_loss_policy = total_loss_policy.detach().cpu()
+            total_loss_entropy = total_loss_entropy.detach().cpu()
             if config_copy.prio_alpha > 0:
-                mask_update_priority = torch.lt(state_float_tensor[:, 0], config_copy.min_horizon_to_update_priority_actions).detach().cpu()
-                # Only update the transition priority if the transition was sampled with a sufficiently long-term horizon.
-                buffer.update_priority(
-                    batch_info["index"][mask_update_priority],
-                    (outputs_tau3.mean(axis=1) - outputs_target_tau2.mean(axis=1))
-                    .abs()[mask_update_priority]
-                    .detach()
-                    .cpu()
-                    .type(torch.float64),
-                )
-        return total_loss, grad_norm
-
+                buffer.update_priority(batch_info["index"], loss_Q_network.detach().cpu().type(torch.float64))
+        return total_loss_Q_network, total_loss_policy, total_loss_entropy, policy_entropy.cpu().mean()
 
 class Inferer:
-    __slots__ = (
-        "inference_network",
-        "iqn_k",
-        "epsilon",
-        "epsilon_boltzmann",
-        "tau_epsilon_boltzmann",
-        "is_explo",
-    )
-
-    def __init__(self, inference_network, iqn_k, tau_epsilon_boltzmann):
-        self.inference_network = inference_network
-        self.iqn_k = iqn_k
+    def __init__(self, inference_network):
+        self.policy_model = inference_network
         self.epsilon = None
-        self.epsilon_boltzmann = None
-        self.tau_epsilon_boltzmann = tau_epsilon_boltzmann
-        self.is_explo = None
 
-    def infer_network(self, img_inputs_uint8: npt.NDArray, float_inputs: npt.NDArray, tau=None) -> npt.NDArray:
-        """
-        Perform inference of a single state through self.inference_network.
-
-        Args:
-            img_inputs_uint8:   a numpy array of shape (1, H, W) and dtype np.uint8
-            float_inputs:       a numpy array of shape (float_input_dim, ) and dtype np.float32
-            tau:                a torch.Tensor of shape (iqn_k,  1)
-
-        Returns:
-            q_values:           a numpy array of shape (iqn_k, 1)
-        """
+    def get_exploration_action(self, img_inputs, float_inputs):
         with torch.no_grad():
-            state_img_tensor = (
-                torch.from_numpy(img_inputs_uint8)
-                .unsqueeze(0)
-                .to("cuda", memory_format=torch.channels_last, non_blocking=True, dtype=torch.float32)
-                - 128
-            ) / 128
+            state_img_tensor = torch.from_numpy(img_inputs).unsqueeze(0).to("cuda", memory_format=torch.channels_last, non_blocking=True)
             state_float_tensor = torch.from_numpy(np.expand_dims(float_inputs, axis=0)).to("cuda", non_blocking=True)
-            q_values = (
-                self.inference_network(
+            policy = (
+                self.policy_model(
                     state_img_tensor,
                     state_float_tensor,
-                    self.iqn_k,
-                    tau=tau,  # torch.linspace(0.05, 0.95, self.iqn_k, device="cuda")[:, None],
-                )[0]
+                    use_fp32=True,
+                )
                 .cpu()
-                .numpy()
-                .astype(np.float32)
+                .exp()
             )
-            return q_values
 
-    def get_exploration_action(self, img_inputs_uint8: npt.NDArray, float_inputs: npt.NDArray) -> Tuple[int, bool, float, npt.NDArray]:
-        """
-        Selects an action according to the exploration strategy.
-        Implements epsilon-greedy exploration, as well as Boltzmann exploration, quantiles values are averaged.
-        Configuration is done with self.epsilon (float), self.epsilon_boltzmann (float), self.tau_epsilon_boltzmann (float), and self.is_explo (bool).
-
-        Args:
-            img_inputs_uint8:   a numpy array of shape (1, H, W) and dtype np.uint8
-            float_inputs:       a numpy array of shape (float_input_dim, ) and dtype np.float32
-
-        Returns:
-            action_chosen_idx:  an int indicating which exploration action is sampled
-            is_greedy:          a bool indicating whether this action would have been chosen under a greedy policy
-            V(state):           a float giving the value of the greedy action
-            q_values:           a numpy array giving the q_values for all actions
-        """
-
-        q_values = self.infer_network(img_inputs_uint8, float_inputs).mean(axis=0)
-        r = random.random()
-
-        if self.is_explo and r < self.epsilon:
-            # Choose a random action
-            get_argmax_on = np.random.randn(*q_values.shape)
-        elif self.is_explo and r < self.epsilon + self.epsilon_boltzmann:
-            get_argmax_on = q_values + self.tau_epsilon_boltzmann * np.random.randn(*q_values.shape)
+        if self.epsilon >= 0:
+            # Train
+            if random.random() < self.epsilon:
+                # Choose a random action
+                action_chosen_idx = random.randrange(len(config_copy.inputs))
+            else:
+                action_dist = Categorical(policy)
+                action_chosen_idx = action_dist.sample().item()
+            greedy_action_idx = np.argmax(policy)
         else:
-            get_argmax_on = q_values
-
-        action_chosen_idx = np.argmax(get_argmax_on)
-        greedy_action_idx = np.argmax(q_values)
+            # Eval
+            action_chosen_idx = np.argmax(policy)
+            greedy_action_idx = action_chosen_idx
 
         return (
             action_chosen_idx,
             action_chosen_idx == greedy_action_idx,
-            np.max(q_values),
-            q_values,
+            policy.max().item(),  # TODO change name in tensorboard
+            policy.numpy(),  # TODO change name in tensorboard
         )
 
 
-def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Network, IQN_Network]:
-    """
-    Constructs two identical copies of the IQN network.
-
-    The first copy is compiled (if jit == True) and is used for inference, for rollouts, for training, etc...
-    The second copy is never compiled and **only** used to efficiently share a neural network's weights between processes.
-
-    Args:
-        jit: a boolean indicating whether compilation should be used
-    """
-
-    uncompiled_model = IQN_Network(
+def make_untrained_SoftIQNQNetwork():
+    network = SoftIQNQNetwork(
         float_inputs_dim=config_copy.float_input_dim,
         float_hidden_dim=config_copy.float_hidden_dim,
         conv_head_output_dim=config_copy.conv_head_output_dim,
@@ -458,15 +496,21 @@ def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Netwo
         float_inputs_mean=config_copy.float_inputs_mean,
         float_inputs_std=config_copy.float_inputs_std,
     )
-    if jit:
-        if config_copy.is_linux:
-            compile_mode = None if "rocm" in torch.__version__ else ("max-autotune" if is_inference else "max-autotune-no-cudagraphs")
-            model = torch.compile(uncompiled_model, dynamic=False, mode=compile_mode)
-        else:
-            model = torch.jit.script(uncompiled_model)
-    else:
-        model = copy.deepcopy(uncompiled_model)
-    return (
-        model.to(device="cuda", memory_format=torch.channels_last).train(),
-        uncompiled_model.to(device="cuda", memory_format=torch.channels_last).train(),
+    return torch.jit.script(network).to(device="cuda", memory_format=torch.channels_last).train(), network.to(device="cuda", memory_format=torch.channels_last).train()
+
+
+def make_untrained_PolicyNetwork():
+    network = LogPolicyNetwork(
+        float_inputs_dim=config_copy.float_input_dim,
+        float_hidden_dim=config_copy.float_hidden_dim,
+        conv_head_output_dim=config_copy.conv_head_output_dim,
+        dense_hidden_dimension=config_copy.dense_hidden_dimension,
+        n_actions=len(config_copy.inputs),
+        float_inputs_mean=config_copy.float_inputs_mean,
+        float_inputs_std=config_copy.float_inputs_std,
     )
+    return torch.jit.script(network).to(device="cuda", memory_format=torch.channels_last).train(), network.to(device="cuda", memory_format=torch.channels_last).train()
+
+def make_untrained_LogAlphaSingletonNetwork():
+    network = LogAlphaSingletonNetwork()
+    return torch.jit.script(network).to(device="cuda", memory_format=torch.channels_last).train(), network.to(device="cuda", memory_format=torch.channels_last).train()
