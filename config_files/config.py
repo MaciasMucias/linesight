@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v7"
+run_name = "sac_run_v10"
 running_speed = 10
 
 tm_engine_step_per_action = 5
@@ -105,6 +105,8 @@ alpha_lr_schedule = [
     (12_000_000 * global_schedule_speed, 5e-5),
     (15_000_000 * global_schedule_speed, 1e-5),
 ]
+
+learn_alpha = True
 alpha_initial_value = 0.2
 dynamic_alpha = False
 polyak = 0.99

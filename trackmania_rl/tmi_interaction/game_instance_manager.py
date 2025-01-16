@@ -467,26 +467,25 @@ class GameInstanceManager:
 
                     floats = np.hstack(
                         (
-                            0,  # 0
+                            0,                                                                      # 0
                             np.array(
                                 previous_actions
-                            ).flatten(),  # 1 - 16
-                            sim_state_car_gear_and_wheels.ravel(),  # 17 - 36
-                            state_car_angular_velocity_in_car_reference_system.ravel(), # 37 - 39
-                            state_car_velocity_in_car_reference_system.ravel(), # 40 - 42
-                            state_y_map_vector_in_car_reference_system.ravel(),
-                            state_zone_center_coordinates_in_car_reference_system.ravel(),
-                            min(
+                            ).flatten(),                                                            # 1 - 15
+                            sim_state_car_gear_and_wheels.ravel(),                                  # 16 - 47
+                            state_car_angular_velocity_in_car_reference_system.ravel(),             # 48 - 50
+                            state_car_velocity_in_car_reference_system.ravel(),                     # 51 - 53
+                            state_y_map_vector_in_car_reference_system.ravel(),                     # 54 - 56
+                            state_zone_center_coordinates_in_car_reference_system.ravel(),          # 57 - 176
+                            min(                                                                    # 177
                                 config_copy.margin_to_announce_finish_meters,
                                 distance_from_start_track_to_prev_zone_transition[
                                     len(zone_centers) - config_copy.n_zone_centers_extrapolate_after_end_of_map
                                 ]
                                 - distance_since_track_begin,
                             ),
-                            sim_state_mobil.is_freewheeling,
+                            sim_state_mobil.is_freewheeling,                                        # 178
                         )
-                    ).astype(np.float32)
-
+                    )
                     pc5 = time.perf_counter_ns()
                     instrumentation__grab_floats += pc5 - pc2
 

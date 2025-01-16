@@ -4,13 +4,11 @@ This file implements the main training loop, tensorboard statistics tracking, et
 
 import copy
 import importlib
-import math
 import random
 import sys
 import time
 import typing
 from collections import defaultdict
-from copy import deepcopy
 from datetime import datetime
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -25,7 +23,6 @@ from torchrl.data.replay_buffers import PrioritizedSampler
 from config_files import config_copy
 from trackmania_rl import buffer_management, utilities
 from trackmania_rl.agents import sac
-from trackmania_rl.agents.sac import make_untrained_sac_network
 from trackmania_rl.analysis_metrics import (
     distribution_curves,
     highest_prio_transitions,
@@ -108,23 +105,9 @@ def learner_process_fn(
     # Create new stuff
     # ========================================================
 
-    online_network, uncompiled_online_network = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
     # target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-    def make_target_network(old_network):
-        """Creates target network with gradients disabled."""
-        new_network = deepcopy(old_network)
 
-        # Properly detach and disable gradients
-        for p in new_network.parameters():
-            p.detach_()
-            p.requires_grad_(False)
 
-        return new_network
-
-    target_network = make_target_network(online_network)
-
-    print(online_network)
-    utilities.count_parameters(online_network)
 
     accumulated_stats: defaultdict[str, typing.Any] = defaultdict(int)
     accumulated_stats["alltime_min_ms"] = {}
@@ -137,27 +120,26 @@ def learner_process_fn(
     time_training_since_last_tensorboard_write = 0
     time_testing_since_last_tensorboard_write = 0
 
+
+
+    trainer = sac.Trainer(
+        batch_size=config_copy.batch_size,
+        autolearn_alpha=config_copy.learn_alpha,
+        cumul_number_memories_generated=accumulated_stats["cumul_number_memories_generated"]
+    )
+
     # ========================================================
     # Load existing stuff
     # ========================================================
     # noinspection PyBroadException
-    try:
-        online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
-        print(" =====================     Learner weights loaded !     ============================")
-    except:
-        print(" Learner could not load weights")
 
+    print(trainer.ac)
+    utilities.count_parameters(trainer.ac)
+
+    accumulated_stats = trainer.load_weights_and_stats()
     with shared_network_lock:
-        uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
-
-    # noinspection PyBroadException
-    try:
-        accumulated_stats = joblib.load(save_dir / "accumulated_stats.joblib")
-        shared_steps.value = accumulated_stats["cumul_number_memories_generated"]
-        print(" =====================      Learner stats loaded !      ============================")
-    except:
-        print(" Learner could not load stats")
+        uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
+    shared_steps.value = accumulated_stats["cumul_number_memories_generated"]
 
     if "rolling_mean_ms" not in accumulated_stats.keys():
         # Temporary to preserve compatibility with old runs that doesn't have this feature. To be removed later.
@@ -168,62 +150,6 @@ def learner_process_fn(
     neural_net_reset_counter = 0
     single_reset_flag = config_copy.single_reset_flag
 
-
-    critic_lr = utilities.from_exponential_schedule(
-        config_copy.critic_lr_schedule, accumulated_stats["cumul_number_memories_generated"],
-    )
-    policy_lr = utilities.from_exponential_schedule(
-        config_copy.policy_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
-    )
-    alpha_lr = utilities.from_exponential_schedule(
-        config_copy.alpha_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
-    )
-
-    log_alpha = torch.tensor(config_copy.alpha_initial_value,
-                             dtype=torch.float32,
-                             device="cuda",
-                             requires_grad=True)
-
-    critic_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['q1_net', 'q2_net'])],
-                                        lr=critic_lr,
-                                        eps=config_copy.adam_epsilon,
-                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-                                        weight_decay=1e-5)
-    critic_scaler = torch.amp.GradScaler(
-        "cuda",
-        init_scale=2**10,  # Start smaller
-        growth_factor=1.5,  # Grow more slowly (default is 2)
-        backoff_factor=0.5,  # Back off more aggressively
-        growth_interval=2000  # Increase scale less frequently
-    )
-
-    policy_optimizer = torch.optim.Adam([p for name, p in online_network.named_parameters()
-        if any(x in name for x in ['policy_mean', 'policy_log_std'])],
-                                        lr=policy_lr,
-                                        eps=config_copy.adam_epsilon,
-                                        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-                                        weight_decay=1e-5)
-    policy_scaler = torch.amp.GradScaler(
-        "cuda",
-        init_scale=2**10,  # Start smaller
-        growth_factor=1.5,  # Grow more slowly (default is 2)
-        backoff_factor=0.5,  # Back off more aggressively
-        growth_interval=2000  # Increase scale less frequently
-    )
-
-    alpha_optimizer = torch.optim.Adam([log_alpha],
-                                       lr=alpha_lr,
-                                       eps=config_copy.adam_epsilon,
-                                       betas=(config_copy.adam_beta1, config_copy.adam_beta2))
-    alpha_scaler = torch.amp.GradScaler(
-        "cuda",
-        init_scale=2**10,  # Start smaller
-        growth_factor=1.5,  # Grow more slowly (default is 2)
-        backoff_factor=0.5,  # Back off more aggressively
-        growth_interval=2000  # Increase scale less frequently
-    )
-
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_memories_generated"]
     )
@@ -231,16 +157,6 @@ def learner_process_fn(
     offset_cumul_number_single_memories_used = memory_size_start_learn * config_copy.number_times_single_memory_is_used_before_discard
 
     # noinspection PyBroadException
-    try:
-        policy_optimizer.load_state_dict(torch.load(f=save_dir / "policy_optimizer.torch", weights_only=False))
-        critic_optimizer.load_state_dict(torch.load(f=save_dir / "critic_optimizer.torch", weights_only=False))
-        alpha_optimizer.load_state_dict(torch.load(f=save_dir / "alpha_optimizer.torch", weights_only=False))
-        policy_scaler.load_state_dict(torch.load(f=save_dir / "policy_scaler.torch", weights_only=False))
-        critic_scaler.load_state_dict(torch.load(f=save_dir / "critic_scaler.torch", weights_only=False))
-        alpha_scaler.load_state_dict(torch.load(f=save_dir / "alpha_scaler.torch", weights_only=False))
-        print(" =========================     Optimizers loaded !     ================================")
-    except:
-        print(" Could not load optimizer")
 
     tensorboard_suffix = utilities.from_staircase_schedule(
         config_copy.tensorboard_suffix_schedule,
@@ -261,21 +177,10 @@ def learner_process_fn(
     # ========================================================
     # Make the trainer
     # ========================================================
-    trainer = sac.Trainer(
-        online_network=online_network,
-        target_network=target_network,
-        policy_optimizer=policy_optimizer,
-        critic_optimizer=critic_optimizer,
-        alpha_optimizer=alpha_optimizer,
-        policy_scaler=policy_scaler,
-        critic_scaler=critic_scaler,
-        alpha_scaler=alpha_scaler,
-        batch_size=config_copy.batch_size,
-        log_alpha=log_alpha,
-    )
+
 
     inferer = sac.Inferer(
-        inference_network=online_network
+        inference_network=trainer.ac
     )
 
     while True:  # Trainer loop
@@ -328,21 +233,30 @@ def learner_process_fn(
         #   VERY BASIC TRAINING ANNEALING
         # ===============================================
 
+        q_lr = utilities.from_exponential_schedule(
+            config_copy.critic_lr_schedule, accumulated_stats["cumul_number_memories_generated"],
+        )
+        pi_lr = utilities.from_exponential_schedule(
+            config_copy.policy_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
+        )
+        alpha_lr = utilities.from_exponential_schedule(
+            config_copy.alpha_lr_schedule, accumulated_stats["cumul_number_memories_generated"]
+        )
         gamma = utilities.from_linear_schedule(config_copy.gamma_schedule, accumulated_stats["cumul_number_memories_generated"])
 
         # ===============================================
         #   RELOAD
         # ===============================================
 
-        for param_group in policy_optimizer.param_groups:
-            param_group["lr"] = policy_lr
+        for param_group in trainer.pi_optimizer.param_groups:
+            param_group["lr"] = pi_lr
             param_group["epsilon"] = config_copy.adam_epsilon
             param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
-        for param_group in critic_optimizer.param_groups:
-            param_group["lr"] = critic_lr
+        for param_group in trainer.q_optimizer.param_groups:
+            param_group["lr"] = q_lr
             param_group["epsilon"] = config_copy.adam_epsilon
             param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
-        for param_group in alpha_optimizer.param_groups:
+        for param_group in trainer.alpha_optimizer.param_groups:
             param_group["lr"] = alpha_lr
             param_group["epsilon"] = config_copy.adam_epsilon
             param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
@@ -454,17 +368,7 @@ def learner_process_fn(
                     f"{name}.inputs",
                     inputs_only=False,
                 )
-                utilities.save_checkpoint(
-                    save_dir / "best_runs",
-                    online_network,
-                    target_network,
-                    policy_optimizer,
-                    critic_optimizer,
-                    alpha_optimizer,
-                    policy_scaler,
-                    critic_scaler,
-                    alpha_scaler,
-                )
+                trainer.save(save_dir)
 
         if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
             name = f"{map_name}_{end_race_stats['race_time']}_{datetime.now().strftime('%m%d_%H%M%S')}_{accumulated_stats['cumul_number_frames_played']}_{'explo' if is_explo else 'eval'}"
@@ -506,8 +410,8 @@ def learner_process_fn(
             #   LEARN ON BATCH
             # ===============================================
 
-            if not online_network.training:
-                online_network.train()
+            if not trainer.ac.training:
+                trainer.ac.train()
 
             while (
                 len(buffer) >= memory_size_start_learn
@@ -549,7 +453,7 @@ def learner_process_fn(
 
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
-                            uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
+                            uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
             sys.stdout.flush()
 
         # ===============================================
@@ -578,10 +482,10 @@ def learner_process_fn(
                 "gamma": gamma,
                 "n_steps": config_copy.n_steps,
                 "epsilon": utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value),
-                "policy_lr": policy_optimizer.param_groups[0]["lr"],
-                "critic_lr": critic_optimizer.param_groups[0]["lr"],
-                "alpha_lr": alpha_optimizer.param_groups[0]["lr"],
-                "alpha_value": torch.exp(log_alpha).item(),
+                "policy_lr": trainer.pi_optimizer.param_groups[0]["lr"],
+                "critic_lr": trainer.q_optimizer.param_groups[0]["lr"],
+                "alpha_lr": trainer.alpha_optimizer.param_groups[0]["lr"],
+                "alpha_value": torch.exp(trainer.alpha_t).item(),
                 "discard_non_greedy_actions_in_nsteps": config_copy.discard_non_greedy_actions_in_nsteps,
                 "memory_size": len(buffer),
                 "number_times_single_memory_is_used_before_discard": config_copy.number_times_single_memory_is_used_before_discard,
@@ -605,8 +509,8 @@ def learner_process_fn(
                     "train_on_batch_duration": np.median(train_on_batch_duration_history),
                 })
 
-            if online_network.training:
-                online_network.eval()
+            if trainer.ac.training:
+                trainer.ac.eval()
 
             critic_loss_history = []
             policy_loss_history = []
@@ -622,8 +526,10 @@ def learner_process_fn(
             #   WRITE TO TENSORBOARD
             # ===============================================
 
+            # TODO
+
             walltime_tb = time.time()
-            for name, param in online_network.named_parameters():
+            for name, param in trainer.ac.named_parameters():
                 # Categorize parameters by network type
                 if any(x in name for x in ['policy_mean', 'policy_logprob']):
                     prefix = "policy"
