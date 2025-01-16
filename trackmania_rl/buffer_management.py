@@ -121,10 +121,12 @@ def fill_buffer_from_rollout_with_n_steps_rule(
         next_state_has_passed_finish = ((i + n_steps) == (n_frames - 1)) and ("race_time" in rollout_results)
 
         if not next_state_has_passed_finish:
+            minirace_min_time_actions = 0
             next_state_img = rollout_results["frames"][i + n_steps]
             next_state_float = rollout_results["state_float"][i + n_steps]
         else:
             # It doesn't matter what next_state_img and next_state_float contain, as the transition will be forced to be final
+            minirace_min_time_actions = config_copy.temporal_mini_race_duration_actions - n_steps
             next_state_img = state_img
             next_state_float = state_float
 
@@ -138,7 +140,7 @@ def fill_buffer_from_rollout_with_n_steps_rule(
                 next_state_img,
                 next_state_float,
                 gammas,
-                terminal_actions,
+                minirace_min_time_actions,
             )
         )
     number_memories_added_train += len(Experiences_For_Buffer)

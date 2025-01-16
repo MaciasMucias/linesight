@@ -19,155 +19,65 @@ from torchrl.data.replay_buffers.utils import INT_CLASSES, _to_numpy
 
 from config_files import config_copy
 
-to_torch_dtype = {
-    np.uint8: torch.uint8,
-    np.float32: torch.float32,
-    np.int64: torch.int64,
-    float: torch.float32,
-    int: torch.int,
-    np.float64: torch.float32,
-}
-
-
-def fast_collate_cpu(batch, attr_name):
-    elem = getattr(batch[0], attr_name)
-    elem_array = hasattr(elem, "__len__")
-    shape = (len(batch),) + (elem.shape if elem_array else ())
-    data_type = type(elem.flat[0] if elem_array else elem)
-    data_type = to_torch_dtype[data_type]
-    buffer = torch.empty(size=shape, dtype=data_type, pin_memory=True).numpy()
-    attr_getter = attrgetter(attr_name)
-    source = [attr_getter(memory) for memory in batch]
-    buffer[:] = source[:]
-    return buffer
-
-
-def send_to_gpu(batch, attr_name):
-    return torch.as_tensor(batch).to(
+def fast_collate(batch, attr_name):
+    return torch.as_tensor(np.array([getattr(memory, attr_name) for memory in batch])).to(
         non_blocking=True, device="cuda", memory_format=torch.channels_last if "img" in attr_name else torch.preserve_format
     )
 
 
 def buffer_collate_function(batch):
-    (
-        state_img,
-        state_float,
-        state_potential,
-        action,
-        rewards,
-        next_state_img,
-        next_state_float,
-        next_state_potential,
-        gammas,
-        terminal_actions,
-        n_steps,
-    ) = tuple(
+    state_img, state_float, action, n_steps, rewards, next_state_img, next_state_float, gammas, minirace_min_time_actions = tuple(
         map(
-            lambda attr_name: fast_collate_cpu(batch, attr_name),
+            lambda attr_name: fast_collate(batch, attr_name),
             [
                 "state_img",
                 "state_float",
-                "state_potential",
                 "action",
-                "rewards",
-                "next_state_img",
-                "next_state_float",
-                "next_state_potential",
-                "gammas",
-                "terminal_actions",
                 "n_steps",
-            ],
-        )
-    )
-
-    temporal_mini_race_current_time_actions = (
-        np.abs(
-            np.random.randint(
-                low=-config_copy.oversample_long_term_steps + config_copy.oversample_maximum_term_steps,
-                high=config_copy.temporal_mini_race_duration_actions + config_copy.oversample_maximum_term_steps,
-                size=(len(state_img),),
-                dtype=int,
-            )
-        )
-        - config_copy.oversample_maximum_term_steps
-    ).clip(min=0)
-
-    temporal_mini_race_next_time_actions = temporal_mini_race_current_time_actions + n_steps
-
-    state_float[:, 0] = temporal_mini_race_current_time_actions
-    next_state_float[:, 0] = temporal_mini_race_next_time_actions
-
-    possibly_reduced_n_steps = n_steps - (temporal_mini_race_next_time_actions - config_copy.temporal_mini_race_duration_actions).clip(
-        min=0
-    )
-
-    terminal = (possibly_reduced_n_steps >= terminal_actions) | (
-        temporal_mini_race_next_time_actions >= config_copy.temporal_mini_race_duration_actions
-    )
-
-    gammas = np.take_along_axis(gammas, possibly_reduced_n_steps[:, None] - 1, axis=1).squeeze(-1)
-    gammas = np.where(terminal, 0, gammas)
-
-    rewards = np.take_along_axis(rewards, possibly_reduced_n_steps[:, None] - 1, axis=1).squeeze(-1)
-
-    rewards += np.where(terminal, 0, gammas * next_state_potential)
-    rewards -= state_potential
-
-    state_img, state_float, action, rewards, next_state_img, next_state_float, gammas = tuple(
-        map(
-            lambda batch, attr_name: send_to_gpu(batch, attr_name),
-            [
-                state_img,
-                state_float,
-                action,
-                rewards,
-                next_state_img,
-                next_state_float,
-                gammas,
-            ],
-            [
-                "state_img",
-                "state_float",
-                "action",
                 "rewards",
                 "next_state_img",
                 "next_state_float",
                 "gammas",
+                "minirace_min_time_actions",
             ],
         )
     )
+    if config_copy.apply_horizontal_flip_augmentation:
+        # Apply Horizontal Flipping
+        use_horizontal_flip = torch.rand(len(state_img), device="cuda") < config_copy.flip_augmentation_ratio
+        state_img = torch.where(use_horizontal_flip[:, None, None, None], torch.flip(state_img, dims=(-1,)), state_img)  # state_img
+        next_state_img = torch.where(
+            use_horizontal_flip[:, None, None, None], torch.flip(next_state_img, dims=(-1,)), next_state_img
+        )  # next_state_img
+        # 0 Forward 1 Forward left 2 Forward right 3 Nothing 4 Nothing left 5 Nothing right 6 Brake 7 Brake left 8 Brake right 9 Brake and accelerate 10 Brake and accelerate left 11 Brake and accelerate right
+        # becomes
+        # 0 Forward 1 Forward right 2 Forward left 3 Nothing 4 Nothing right 5 Nothing left 6 Brake 7 Brake right 8 Brake left 9 Brake and accelerate 10 Brake and accelerate right 11 Brake and accelerate left
+        action_flipped = torch.tensor([0, 2, 1, 3, 5, 4, 6, 8, 7, 9, 11, 10], device="cuda", dtype=torch.int64)
+        action = torch.where(use_horizontal_flip, torch.gather(action_flipped, 0, action), action)
 
-    state_img = (state_img.to(torch.float16) - 128) / 128
-    next_state_img = (next_state_img.to(torch.float16) - 128) / 128
+        # From SaiMoen on TMI Discord, the order of wheels in simulation_state is fl, fr, br, bl
 
-    if config_copy.apply_randomcrop_augmentation:
-        # Same transformation is applied for state and next_state.
-        # Different transformation is applied to each element in a batch.
-        i = random.randint(0, 2 * config_copy.n_pixels_to_crop_on_each_side)
-        j = random.randint(0, 2 * config_copy.n_pixels_to_crop_on_each_side)
-        state_img = transforms.functional.crop(
-            transforms.functional.pad(state_img, padding=config_copy.n_pixels_to_crop_on_each_side, padding_mode="edge"),
-            i,
-            j,
-            config_copy.H_downsized,
-            config_copy.W_downsized,
-        )
-        next_state_img = transforms.functional.crop(
-            transforms.functional.pad(next_state_img, padding=config_copy.n_pixels_to_crop_on_each_side, padding_mode="edge"),
-            i,
-            j,
-            config_copy.H_downsized,
-            config_copy.W_downsized,
-        )
+        def float_inputs_horizontal_symmetry(floats):
+            floats_flipped = floats.clone()
+            floats_flipped[:, config_copy.flip_indices_floats_before_swap] = floats_flipped[
+                :, config_copy.flip_indices_floats_after_swap
+            ]  # Swap left right features
+            floats_flipped[:, config_copy.indices_floats_sign_inversion] *= -1  # Multiply by -1 relevant coordinates
+            return floats_flipped
+
+        state_float = torch.where(use_horizontal_flip[:, None], float_inputs_horizontal_symmetry(state_float), state_float)
+        next_state_float = torch.where(use_horizontal_flip[:, None], float_inputs_horizontal_symmetry(next_state_float), next_state_float)
 
     return (
         state_img,
         state_float,
         action,
+        n_steps,
         rewards,
         next_state_img,
         next_state_float,
         gammas,
+        minirace_min_time_actions,
     )
 
 

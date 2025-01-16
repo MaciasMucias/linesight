@@ -449,9 +449,10 @@ class Inferer:
         self.policy_model = inference_network
         self.epsilon = None
 
-    def get_exploration_action(self, img_inputs, float_inputs):
+    def infer_network(self, img_inputs, float_inputs):
         with torch.no_grad():
-            state_img_tensor = torch.from_numpy(img_inputs).unsqueeze(0).to("cuda", memory_format=torch.channels_last, non_blocking=True)
+            state_img_tensor = torch.from_numpy(img_inputs).unsqueeze(0).to("cuda", memory_format=torch.channels_last,
+                                                                            non_blocking=True)
             state_float_tensor = torch.from_numpy(np.expand_dims(float_inputs, axis=0)).to("cuda", non_blocking=True)
             policy = (
                 self.policy_model(
@@ -462,7 +463,10 @@ class Inferer:
                 .cpu()
                 .exp()
             )
+        return policy
 
+    def get_exploration_action(self, img_inputs, float_inputs):
+        policy = self.infer_network(img_inputs, float_inputs)
         if self.epsilon >= 0:
             # Train
             if random.random() < self.epsilon:

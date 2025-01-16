@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 from config_files import config_copy
-from trackmania_rl.agents.iqn import iqn_loss
+
 
 
 def batched(iterable, n):  # Can be included from itertools with python >=3.12
@@ -251,16 +251,16 @@ def get_output_and_target_for_batch(batch, online_network, target_network, num_q
                 q__st__online__quantiles_tau3.gather(1, actions).reshape([num_quantiles, batch_size, 1]).transpose(0, 1)
             )  # (batch_size, iqn_n, 1)
 
-    losses = {
-        "target_self_loss": iqn_loss(outputs_target_tau2, outputs_target_tau2, tau, num_quantiles, batch_size).cpu().numpy(),
-        "output_self_loss": iqn_loss(outputs_tau3, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
-        "real_loss": iqn_loss(outputs_target_tau2, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
-    }
+    # losses = {
+    #     "target_self_loss": iqn_loss(outputs_target_tau2, outputs_target_tau2, tau, num_quantiles, batch_size).cpu().numpy(),
+    #     "output_self_loss": iqn_loss(outputs_tau3, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
+    #     "real_loss": iqn_loss(outputs_target_tau2, outputs_tau3, tau, num_quantiles, batch_size).cpu().numpy(),
+    # }
 
     return (
         (is_terminal * outputs_tau3).cpu().numpy().astype(np.float32),
         (is_terminal * outputs_target_tau2).cpu().numpy().astype(np.float32),
-        losses,
+        {}#losses,
     )
 
 

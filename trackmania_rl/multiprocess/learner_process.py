@@ -17,7 +17,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
-import torch_optimizer
 from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
@@ -34,6 +33,11 @@ from trackmania_rl.analysis_metrics import (
 )
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
+
+from torch_optimizer import Lookahead
+
+Lookahead._optimizer_state_dict_pre_hooks = {}
+Lookahead._optimizer_state_dict_post_hooks = {}
 
 
 def learner_process_fn(
@@ -172,10 +176,10 @@ def learner_process_fn(
     # ========================================================
     # noinspection PyBroadException
     try:
-        soft_Q_model1.load_state_dict(torch.load(save_dir / "soft_Q_weights1.torch"))
-        soft_Q_model2.load_state_dict(torch.load(save_dir / "soft_Q_weights2.torch"))
-        policy_model.load_state_dict(torch.load(save_dir / "policy_weights.torch"))
-        logalpha_model.load_state_dict(torch.load(save_dir / "logalpha_weights.torch"))
+        soft_Q_model1.load_state_dict(torch.load(save_dir / "soft_Q_weights1.torch", weights_only=False))
+        soft_Q_model2.load_state_dict(torch.load(save_dir / "soft_Q_weights2.torch", weights_only=False))
+        policy_model.load_state_dict(torch.load(save_dir / "policy_weights.torch", weights_only=False))
+        logalpha_model.load_state_dict(torch.load(save_dir / "logalpha_weights.torch", weights_only=False))
         print(" =========================     Weights loaded !     ================================")
     except:
         print(" Could not load weights")
@@ -207,7 +211,7 @@ def learner_process_fn(
             eps=config_copy.adam_epsilon,
             betas=(0.9, 0.95),
         )
-    soft_Q_optimizer = torch_optimizer.Lookahead(soft_Q_optimizer, k=5, alpha=0.5)
+    soft_Q_optimizer = Lookahead(soft_Q_optimizer, k=5, alpha=0.5)
 
     policy_optimizer = torch.optim.RAdam(
             policy_model.parameters(),
@@ -215,7 +219,7 @@ def learner_process_fn(
             eps=config_copy.adam_epsilon,
             betas=(0.9, 0.95),
         )
-    policy_optimizer = torch_optimizer.Lookahead(policy_optimizer, k=5, alpha=0.5)
+    policy_optimizer = Lookahead(policy_optimizer, k=5, alpha=0.5)
 
     logalpha_optimizer = torch.optim.RAdam(
         logalpha_model.parameters(),
@@ -237,10 +241,10 @@ def learner_process_fn(
 
     # noinspection PyBroadException
     try:
-        soft_Q_optimizer.load_state_dict(torch.load(save_dir / "soft_Q_optimizer.torch"))
-        soft_Q_scaler.load_state_dict(torch.load(save_dir / "soft_Q_scaler.torch"))
-        policy_optimizer.load_state_dict(torch.load(save_dir / "policy_optimizer.torch"))
-        policy_scaler.load_state_dict(torch.load(save_dir / "policy_scaler.torch"))
+        soft_Q_optimizer.load_state_dict(torch.load(save_dir / "soft_Q_optimizer.torch", weights_only=False))
+        soft_Q_scaler.load_state_dict(torch.load(save_dir / "soft_Q_scaler.torch", weights_only=False))
+        policy_optimizer.load_state_dict(torch.load(save_dir / "policy_optimizer.torch", weights_only=False))
+        policy_scaler.load_state_dict(torch.load(save_dir / "policy_scaler.torch", weights_only=False))
         # logalpha_optimizer.load_state_dict(torch.load(save_dir / "logalpha_optimizer.torch"))
         # logalpha_scaler.load_state_dict(torch.load(save_dir / "logalpha_scaler.torch"))
         print(" =========================     Optimizer loaded !     ================================")
@@ -489,10 +493,16 @@ def learner_process_fn(
                 )
                 utilities.save_checkpoint(
                     save_dir / "best_runs",
-                    online_network,
-                    target_network,
-                    optimizer1,
-                    scaler,
+                    soft_Q_model1,
+                    soft_Q_model2,
+                    soft_Q_optimizer,
+                    soft_Q_scaler,
+                    policy_model,
+                    policy_optimizer,
+                    policy_scaler,
+                    logalpha_model,
+                    logalpha_optimizer,
+                    logalpha_scaler
                 )
 
         if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
@@ -512,7 +522,8 @@ def learner_process_fn(
             (
                 buffer,
                 buffer_test,
-                number_memories_added,
+                number_memories_added_train,
+                number_memories_added_test,
             ) = buffer_management.fill_buffer_from_rollout_with_n_steps_rule(
                 buffer,
                 buffer_test,
@@ -520,13 +531,18 @@ def learner_process_fn(
                 config_copy.n_steps,
                 gamma,
                 config_copy.discard_non_greedy_actions_in_nsteps,
-                config_copy.n_zone_centers_in_inputs
+                engineered_speedslide_reward,
+                engineered_neoslide_reward,
+                engineered_kamikaze_reward,
+                engineered_close_to_vcp_reward,
             )
 
-            accumulated_stats["cumul_number_memories_generated"] += number_memories_added
-            accumulated_stats["reset_counter"] += number_memories_added
+            accumulated_stats[
+                "cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
+            shared_steps.value = accumulated_stats["cumul_number_memories_generated"]
+            neural_net_reset_counter += number_memories_added_train
             accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
-                    config_copy.number_times_single_memory_is_used_before_discard * number_memories_added
+                    config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
             )
             print(f" NMG={accumulated_stats['cumul_number_memories_generated']:<8}")
 
@@ -568,9 +584,11 @@ def learner_process_fn(
             #   LEARN ON BATCH
             # ===============================================
 
-            if not online_network.training:
+            if not soft_Q_model1.training:
                 soft_Q_model1.train()
+            if not policy_model.training:
                 policy_model.train()
+            if not logalpha_model.training:
                 logalpha_model.train()
 
             while (
@@ -658,30 +676,30 @@ def learner_process_fn(
                 "learner_percentage_testing": tested_percentage,
                 "transitions_learned_per_second": transitions_learned_per_second,
             }
-            if len(loss_history) > 0 and len(loss_test_history) > 0:
+            if len(loss_Q_history) > 0 and len(loss_Q_test_history) > 0:
                 step_stats.update(
                     {
-                        "loss": np.mean(loss_history),
-                        "loss_test": np.mean(loss_test_history),
+                        "loss_Q": np.mean(loss_Q_history),
+                        "loss_Q_test": np.mean(loss_Q_test_history),
+                        "loss_policy": np.mean(loss_policy_history),
+                        "loss_policy_test": np.mean(loss_policy_test_history),
+                        "loss_alpha": np.mean(loss_alpha_history),
+                        "loss_alpha_test": np.mean(loss_alpha_test_history),
+                        "policy_entropy": np.mean(policy_entropy_history),
+                        "policy_entropy_test": np.mean(policy_entropy_test_history),
                         "train_on_batch_duration": np.median(train_on_batch_duration_history),
-                        "grad_norm_history_q1": np.quantile(grad_norm_history, 0.25),
-                        "grad_norm_history_median": np.quantile(grad_norm_history, 0.5),
-                        "grad_norm_history_q3": np.quantile(grad_norm_history, 0.75),
-                        "grad_norm_history_d9": np.quantile(grad_norm_history, 0.9),
-                        "grad_norm_history_d98": np.quantile(grad_norm_history, 0.98),
-                        "grad_norm_history_max": np.max(grad_norm_history),
                     }
                 )
-                for key, val in layer_grad_norm_history.items():
-                    step_stats.update(
-                        {
-                            f"{key}_median": np.quantile(val, 0.5),
-                            f"{key}_q3": np.quantile(val, 0.75),
-                            f"{key}_d9": np.quantile(val, 0.9),
-                            f"{key}_c98": np.quantile(val, 0.98),
-                            f"{key}_max": np.max(val),
-                        }
-                    )
+                # for key, val in layer_grad_norm_history.items():
+                #     step_stats.update(
+                #         {
+                #             f"{key}_median": np.quantile(val, 0.5),
+                #             f"{key}_q3": np.quantile(val, 0.75),
+                #             f"{key}_d9": np.quantile(val, 0.9),
+                #             f"{key}_c98": np.quantile(val, 0.98),
+                #             f"{key}_max": np.max(val),
+                #         }
+                #     )
             if isinstance(buffer._sampler, PrioritizedSampler):
                 all_priorities = np.array([buffer._sampler._sum_tree.at(i) for i in range(len(buffer))])
                 step_stats.update(
@@ -702,8 +720,14 @@ def learner_process_fn(
             for key, value in accumulated_stats["alltime_min_ms"].items():
                 step_stats[f"alltime_min_ms_{map_name}"] = value
 
-            loss_history = []
-            loss_test_history = []
+            loss_Q_history = []
+            loss_Q_test_history = []
+            loss_policy_history = []
+            loss_policy_test_history = []
+            loss_alpha_history = []
+            loss_alpha_test_history = []
+            policy_entropy_history = []
+            policy_entropy_test_history = []
             train_on_batch_duration_history = []
             grad_norm_history = []
             layer_grad_norm_history = defaultdict(list)
@@ -711,9 +735,15 @@ def learner_process_fn(
             # ===============================================
             #   COLLECT IQN SPREAD
             # ===============================================
+            if soft_Q_model1.training:
+                soft_Q_model1.eval()
 
-            if online_network.training:
-                online_network.eval()
+            if policy_model.training:
+                policy_model.eval()
+
+            if logalpha_model.training:
+                logalpha_model.eval()
+
             tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
 
             # per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
@@ -725,37 +755,115 @@ def learner_process_fn(
             # ===============================================
 
             walltime_tb = time.time()
-            for name, param in online_network.named_parameters():
+
+            for name, param in soft_Q_model1.named_parameters():
                 tensorboard_writer.add_scalar(
-                    tag=f"layer_{name}_L2",
+                    tag=f"critic_{name}_L2",
                     scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
                     global_step=accumulated_stats["cumul_number_frames_played"],
                     walltime=walltime_tb,
                 )
-            assert len(optimizer1.param_groups) == 1
+
+            for name, param in policy_model.named_parameters():
+                tensorboard_writer.add_scalar(
+                    tag=f"policy_{name}_L2",
+                    scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
+                    global_step=accumulated_stats["cumul_number_frames_played"],
+                    walltime=walltime_tb,
+                )
+
+            for name, param in logalpha_model.named_parameters():
+                tensorboard_writer.add_scalar(
+                    tag=f"alpha_{name}_L2",
+                    scalar_value=np.sqrt((param**2).mean().detach().cpu().item()),
+                    global_step=accumulated_stats["cumul_number_frames_played"],
+                    walltime=walltime_tb,
+                )
+
+            assert len(soft_Q_optimizer.param_groups) == 1
             try:
                 for p, (name, _) in zip(
-                    optimizer1.param_groups[0]["params"],
-                    online_network.named_parameters(),
+                        soft_Q_optimizer.param_groups[0]["params"],
+                        soft_Q_model1.named_parameters(),
                 ):
-                    state = optimizer1.state[p]
+                    state = soft_Q_optimizer.state[p]
                     exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                     mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
                     tensorboard_writer.add_scalar(
-                        tag=f"lr_ratio_{name}_L2",
+                        tag=f"critic_lr_ratio_{name}_L2",
+                        scalar_value=np.sqrt((mod_lr ** 2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+                    tensorboard_writer.add_scalar(
+                        tag=f"critic_exp_avg_{name}_L2",
+                        scalar_value=np.sqrt((exp_avg ** 2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+                    tensorboard_writer.add_scalar(
+                        tag=f"critic_exp_avg_sq_{name}_L2",
+                        scalar_value=np.sqrt((exp_avg_sq ** 2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+            except:
+                pass
+
+            assert len(policy_optimizer.param_groups) == 1
+            try:
+                for p, (name, _) in zip(
+                    policy_optimizer.param_groups[0]["params"],
+                    policy_model.named_parameters(),
+                ):
+                    state = policy_optimizer.state[p]
+                    exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                    mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
+                    tensorboard_writer.add_scalar(
+                        tag=f"policy_lr_ratio_{name}_L2",
                         scalar_value=np.sqrt((mod_lr**2).mean().detach().cpu().item()),
                         global_step=accumulated_stats["cumul_number_frames_played"],
                         walltime=walltime_tb,
                     )
                     tensorboard_writer.add_scalar(
-                        tag=f"exp_avg_{name}_L2",
+                        tag=f"policy_exp_avg_{name}_L2",
                         scalar_value=np.sqrt((exp_avg**2).mean().detach().cpu().item()),
                         global_step=accumulated_stats["cumul_number_frames_played"],
                         walltime=walltime_tb,
                     )
                     tensorboard_writer.add_scalar(
-                        tag=f"exp_avg_sq_{name}_L2",
+                        tag=f"policy_exp_avg_sq_{name}_L2",
                         scalar_value=np.sqrt((exp_avg_sq**2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+            except:
+                pass
+
+            assert len(logalpha_optimizer.param_groups) == 1
+            try:
+                for p, (name, _) in zip(
+                        logalpha_optimizer.param_groups[0]["params"],
+                        logalpha_model.named_parameters(),
+                ):
+                    state = logalpha_optimizer.state[p]
+                    exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                    mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
+                    tensorboard_writer.add_scalar(
+                        tag=f"alpha_lr_ratio_{name}_L2",
+                        scalar_value=np.sqrt((mod_lr ** 2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+                    tensorboard_writer.add_scalar(
+                        tag=f"alpha_exp_avg_{name}_L2",
+                        scalar_value=np.sqrt((exp_avg ** 2).mean().detach().cpu().item()),
+                        global_step=accumulated_stats["cumul_number_frames_played"],
+                        walltime=walltime_tb,
+                    )
+                    tensorboard_writer.add_scalar(
+                        tag=f"alpha_exp_avg_sq_{name}_L2",
+                        scalar_value=np.sqrt((exp_avg_sq ** 2).mean().detach().cpu().item()),
                         global_step=accumulated_stats["cumul_number_frames_played"],
                         walltime=walltime_tb,
                     )
@@ -817,5 +925,17 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
-            utilities.save_checkpoint(save_dir, online_network, target_network, optimizer1, scaler)
+            utilities.save_checkpoint(
+                save_dir,
+                soft_Q_model1,
+                soft_Q_model2,
+                soft_Q_optimizer,
+                soft_Q_scaler,
+                policy_model,
+                policy_optimizer,
+                policy_scaler,
+                logalpha_model,
+                logalpha_optimizer,
+                logalpha_scaler
+            )
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

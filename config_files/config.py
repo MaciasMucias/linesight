@@ -19,7 +19,7 @@ This setup provides the possibility to:
 This file is preconfigured with sensible hyperparameters for the map ESL-Hockolicious, assuming the user
 has a computer with 16GB RAM.
 """
-from itertools import repeat
+from itertools import chain, repeat
 
 from config_files.inputs_list import *
 from config_files.state_normalization import *
@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "run_name_to_be_changed"
+run_name = "d_sac_run_v3"
 running_speed = 80
 
 tm_engine_step_per_action = 5
@@ -334,3 +334,40 @@ entropy_of_typical_target_policy = -(np.log(typical_target_policy) * typical_tar
 target_entropy = entropy_of_typical_target_policy
 truncation_amplitude = 0.92
 sac_alpha = 0.01
+
+apply_horizontal_flip_augmentation = False
+flip_augmentation_ratio = 0.5
+flip_pair_indices_to_swap = [
+    (3, 4),  # previous action left/right
+    (7, 8),  # previous**2 action left/right
+    (11, 12),  # previous**3 action left/right
+    (15, 16),  # previous**4 action left/right
+    (19, 20),  # previous**5 action left/right
+    (21, 22),  # front wheels sliding
+    (23, 24),  # back wheels sliding
+    (25, 26),  # front wheels has_ground_contact
+    (27, 28),  # back wheels has_ground_contact
+    (29, 30),  # front wheels damper_absorb
+    (31, 32),  # back wheels damper_absorb
+    (37, 41),  # front wheels physics behavior 0
+    (38, 42),  # front wheels physics behavior 1
+    (39, 43),  # front wheels physics behavior 2
+    (40, 44),  # front wheels physics behavior 3
+    (45, 49),  # back wheels physics behavior 0
+    (46, 50),  # back wheels physics behavior 1
+    (47, 51),  # back wheels physics behavior 2
+    (48, 52),  # back wheels physics behavior 3
+]
+
+flip_indices_floats_before_swap = list(chain(*flip_pair_indices_to_swap))
+flip_indices_floats_after_swap = list(chain(*map(reversed, flip_pair_indices_to_swap)))
+
+indices_floats_sign_inversion = [
+    54,  # state_car_angular_velocity_in_car_reference_system.y
+    55,  # state_car_angular_velocity_in_car_reference_system.z
+    56,  # state_car_velocity_in_car_reference_system.x
+    59,  # state_y_map_vector_in_car_reference_system.x
+] + [62 + i * 3 for i in range(n_zone_centers_in_inputs)]
+
+lr_policy_ratio = 0.1
+lr_alpha_ratio = 1

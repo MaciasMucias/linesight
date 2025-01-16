@@ -181,13 +181,27 @@ def save_run(
 
 def save_checkpoint(
     checkpoint_dir: Path,
-    online_network: torch.nn.Module,
-    target_network: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    soft_Q_model1,
+    soft_Q_model2,
+    soft_Q_optimizer,
+    soft_Q_scaler,
+    policy_model,
+    policy_optimizer,
+    policy_scaler,
+    logalpha_model,
+    logalpha_optimizer,
+    logalpha_scaler,
 ):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(online_network.state_dict(), checkpoint_dir / "weights1.torch")
-    torch.save(target_network.state_dict(), checkpoint_dir / "weights2.torch")
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer1.torch")
-    torch.save(scaler.state_dict(), checkpoint_dir / "scaler.torch")
+    torch.save(soft_Q_model1.state_dict(), checkpoint_dir / "soft_Q_weights1.torch")
+    torch.save(soft_Q_model2.state_dict(), checkpoint_dir / "soft_Q_weights2.torch")
+    torch.save(soft_Q_optimizer.state_dict(), checkpoint_dir / "soft_Q_optimizer.torch")
+    torch.save(soft_Q_scaler.state_dict(), checkpoint_dir / "soft_Q_scaler.torch")
+
+    torch.save(policy_model.state_dict(), checkpoint_dir / "policy_weights.torch")
+    torch.save(policy_optimizer.state_dict(), checkpoint_dir / "policy_optimizer.torch")
+    torch.save(policy_scaler.state_dict(), checkpoint_dir / "policy_scaler.torch")
+
+    torch.save(logalpha_model.state_dict(), checkpoint_dir / "logalpha_weights.torch")
+    torch.save(logalpha_optimizer.state_dict(), checkpoint_dir / "logalpha_optimizer.torch")
+    torch.save(logalpha_scaler.state_dict(), checkpoint_dir / "logalpha_scaler.torch")
