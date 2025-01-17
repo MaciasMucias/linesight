@@ -485,7 +485,8 @@ class GameInstanceManager:
                             ),
                             sim_state_mobil.is_freewheeling,                                        # 178
                         )
-                    )
+                    ).astype(np.float32)
+
                     pc5 = time.perf_counter_ns()
                     instrumentation__grab_floats += pc5 - pc2
 

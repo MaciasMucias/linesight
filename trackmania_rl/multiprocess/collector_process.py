@@ -45,10 +45,63 @@ def collector_process_fn(
 
     inferer = sac.Inferer(inference_network)
 
+    def verify_network_update(inference_net, shared_net):
+        """
+        Returns True if networks have different weights, False if identical
+        """
+        are_different = False
+
+        # Get state dicts
+        inf_state = inference_net.state_dict()
+        shared_state = shared_net.state_dict()
+
+        # Compare each parameter
+        differences = {}
+        for key in inf_state:
+            if not torch.equal(inf_state[key], shared_state[key]):
+                are_different = True
+                # Calculate difference magnitude
+                diff = (inf_state[key] - shared_state[key]).abs().mean().item()
+                differences[key] = diff
+
+        return are_different, differences
+
     def update_network():
         # Update weights of the inference network
+
+
         with shared_network_lock:
+            # Check weights before update
+            # print("Checking weights before update...")
+            different_before, diffs_before = verify_network_update(
+                uncompiled_inference_network,
+                uncompiled_shared_network
+            )
+            # Perform update
             uncompiled_inference_network.load_state_dict(uncompiled_shared_network.state_dict())
+
+            # # Check weights after update
+            # print("Checking weights after update...")
+            # different_after, diffs_after = verify_network_update(
+            #     uncompiled_inference_network,
+            #     uncompiled_shared_network
+            # )
+            #
+            # if different_before:
+            #     print("Networks were different before update")
+            #     print("Differences by layer:")
+            #     for key, diff in diffs_before.items():
+            #         print(f"{key}: {diff:.8f}")
+            # else:
+            #     print("Networks were identical before update")
+            #
+            # if different_after:
+            #     print("WARNING: Networks still different after update!")
+            #     print("Remaining differences:")
+            #     for key, diff in diffs_after.items():
+            #         print(f"{key}: {diff:.8f}")
+            # else:
+            #     print("Networks successfully synchronized")
 
     # ========================================================
     # Training loop
@@ -108,6 +161,7 @@ def collector_process_fn(
             inference_network.train()
 
         update_network()
+        print("MODE: " + "TRAINING" if is_explo  else ("EVAL" if not inference_network.training else "WEIRD"))
 
         rollout_start_time = time.perf_counter()
         rollout_results, end_race_stats = tmi.rollout(

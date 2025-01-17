@@ -9,6 +9,7 @@ import sys
 import time
 import typing
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
+from art import tprint
 from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
@@ -33,7 +35,23 @@ from trackmania_rl.analysis_metrics import (
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
 
-torch.autograd.set_detect_anomaly(True)
+
+def verify_network_update(inf_state, shared_state):
+    """
+    Returns True if networks have different weights, False if identical
+    """
+    are_different = False
+
+    # Compare each parameter
+    differences = {}
+    for key in inf_state:
+        if not torch.equal(inf_state[key], shared_state[key]):
+            are_different = True
+            # Calculate difference magnitude
+            diff = (inf_state[key] - shared_state[key]).abs().mean().item()
+            differences[key] = diff
+
+    return are_different, differences
 
 def learner_process_fn(
     rollout_queues,
@@ -136,7 +154,9 @@ def learner_process_fn(
     print(trainer.ac)
     utilities.count_parameters(trainer.ac)
 
-    accumulated_stats = trainer.load_weights_and_stats()
+    loaded_accumulated_stats = trainer.load_weights_and_stats(save_dir)
+    if loaded_accumulated_stats is not None:
+        accumulated_stats = loaded_accumulated_stats
     with shared_network_lock:
         uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
     shared_steps.value = accumulated_stats["cumul_number_memories_generated"]
@@ -182,8 +202,21 @@ def learner_process_fn(
     inferer = sac.Inferer(
         inference_network=trainer.ac
     )
+    old_state_dict = deepcopy(trainer.ac_uncompiled.state_dict())
 
     while True:  # Trainer loop
+
+        # new_state_dict = deepcopy(trainer.ac_uncompiled.state_dict())
+        #
+        # different, diffs = verify_network_update(old_state_dict, new_state_dict)
+        # if different:
+        #     print("[LEARNER LOOP] Networks were different before update")
+        #     print("[LEARNER LOOP] Differences by layer:")
+        #     for key, diff in diffs.items():
+        #         print(f"{key}: {diff:.8f}")
+        # else:
+        #     print("[LEARNER LOOP] Networks were the same")
+
         before_wait_time = time.perf_counter()
         wait(rollout_queue_readers)
         time_waited = time.perf_counter() - before_wait_time
@@ -453,13 +486,34 @@ def learner_process_fn(
 
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
+                            #print("[LEARNER] Checking weights before update...")
+                            different_before, diffs_before = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
                             uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
+                            # Check weights after update
+                            #print("[LEARNER] Checking weights after update...")
+                            different_after, diffs_after = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
+
+                            # if different_before:
+                            #     print("[LEARNER] Networks were different before update")
+                            #     print("[LEARNER] Differences by layer:")
+                            #     for key, diff in diffs_before.items():
+                            #         print(f"{key}: {diff:.8f}")
+                            # else:
+                            #     print("[LEARNER] Networks were identical before update")
+                            #
+                            # if different_after:
+                            #     print("[LEARNER] WARNING: Networks still different after update!")
+                            #     print("[LEARNER] Remaining differences:")
+                            #     for key, diff in diffs_after.items():
+                            #         print(f"{key}: {diff:.8f}")
+                            # else:
+                            #     print("[LEARNER] Networks successfully synchronized")
             sys.stdout.flush()
 
         # ===============================================
         #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES # 1 minute
         # ===============================================
-        save_frequency_s = 1 * 60 # 5 * 60
+        save_frequency_s = 2 * 60 # 5 * 60
         if time.perf_counter() - time_last_save >= save_frequency_s:
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
@@ -494,7 +548,6 @@ def learner_process_fn(
                 "learner_percentage_testing": tested_percentage,
                 "transitions_learned_per_second": transitions_learned_per_second,
             }
-            print(len(critic_loss_history), len(critic_loss_test_history))
             if len(critic_loss_history) > 0 and len(critic_loss_test_history) > 0:
 
                 step_stats.update({
@@ -509,9 +562,6 @@ def learner_process_fn(
                     "train_on_batch_duration": np.median(train_on_batch_duration_history),
                 })
 
-            if trainer.ac.training:
-                trainer.ac.eval()
-
             critic_loss_history = []
             policy_loss_history = []
             alpha_loss_history = []
@@ -522,19 +572,22 @@ def learner_process_fn(
             entropy_test_history = []
             train_on_batch_duration_history = []
 
+            if trainer.ac.training:
+                trainer.ac.eval()
+
             # ===============================================
             #   WRITE TO TENSORBOARD
             # ===============================================
 
-            # TODO
-
             walltime_tb = time.time()
             for name, param in trainer.ac.named_parameters():
                 # Categorize parameters by network type
-                if any(x in name for x in ['policy_mean', 'policy_logprob']):
-                    prefix = "policy"
-                elif any(x in name for x in ['q1_net', 'q2_net']):
-                    prefix = "q"
+                if 'pi' in name:
+                    prefix = "pi"
+                elif 'q1' in name:
+                    prefix = "q1"
+                elif 'q2' in name:
+                    prefix = "q2"
                 else:
                     prefix = "shared"
                 print(f"{prefix}/{name}_L2")
@@ -607,6 +660,5 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
-            print("Saving")
-            utilities.save_checkpoint(save_dir, online_network, target_network, policy_optimizer, critic_optimizer, alpha_optimizer, policy_scaler, critic_scaler, alpha_scaler)
+            trainer.save(save_dir)
             joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")

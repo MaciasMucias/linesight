@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from pyexpat import features
 
 from torch.distributions import constraints, Distribution
-from torch.distributions.normal import Normal
 from math import floor
 from config_files import config_copy
 from config_files.config import float_hidden_dim
@@ -67,7 +66,6 @@ def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
 
 
-
 class FeatureExtractor(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -78,44 +76,59 @@ class FeatureExtractor(torch.nn.Module):
         img_head_channels = [1, 16, 32, 64, 32]
         activation_function = torch.nn.LeakyReLU
         self.img_head = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels=img_head_channels[0], out_channels=img_head_channels[1], kernel_size=(4, 4), stride=2),
+            torch.nn.Conv2d(in_channels=img_head_channels[0], out_channels=img_head_channels[1], kernel_size=(4, 4),
+                            stride=2),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[1], out_channels=img_head_channels[2], kernel_size=(4, 4), stride=2),
+            torch.nn.Conv2d(in_channels=img_head_channels[1], out_channels=img_head_channels[2], kernel_size=(4, 4),
+                            stride=2),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[2], out_channels=img_head_channels[3], kernel_size=(3, 3), stride=2),
+            torch.nn.Conv2d(in_channels=img_head_channels[2], out_channels=img_head_channels[3], kernel_size=(3, 3),
+                            stride=2),
             activation_function(inplace=True),
-            torch.nn.Conv2d(in_channels=img_head_channels[3], out_channels=img_head_channels[4], kernel_size=(3, 3), stride=1),
+            torch.nn.Conv2d(in_channels=img_head_channels[3], out_channels=img_head_channels[4], kernel_size=(3, 3),
+                            stride=1),
             activation_function(inplace=True),
             torch.nn.Flatten(),
         )
+
         self.float_feature_extractor = torch.nn.Sequential(
             torch.nn.Linear(self.float_inputs_dim, self.float_hidden_dim),
             activation_function(inplace=True),
             torch.nn.Linear(self.float_hidden_dim, self.float_hidden_dim),
             activation_function(inplace=True),
         )
-        self.float_inputs_mean = torch.tensor(config_copy.float_inputs_mean, dtype=torch.float32).to("cuda")
-        self.float_inputs_std = torch.tensor(config_copy.float_inputs_std, dtype=torch.float32).to("cuda")
+
+        # Register buffers for mean and std
+        self.register_buffer('float_inputs_mean',
+                             torch.tensor(config_copy.float_inputs_mean, dtype=torch.float32))
+        self.register_buffer('float_inputs_std',
+                             torch.tensor(config_copy.float_inputs_std, dtype=torch.float32))
 
         self.output_dim = config_copy.conv_head_output_dim + self.float_hidden_dim
 
-    def forward(self, obs: tuple[torch.Tensor, torch.Tensor], use_fp32: bool = True) -> torch.Tensor:
+    def forward(self, obs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         img, float_inputs = obs
-        img_outputs = self.img_head((img.to(torch.float32 if use_fp32 else torch.float16) - 128) / 128)  # PERF
-        # img_outputs = torch.zeros(batch_size, misc.conv_head_output_dim).to(device="cuda") # Uncomment to temporarily mask the img_head
-        float_outputs = self.float_feature_extractor((float_inputs - self.float_inputs_mean) / self.float_inputs_std)
-        # (batch_size, dense_input_dimension) OK
+
+        # Normalize image similar to IQN approach
+        img = (img - 128.0) / 128.0
+        img_outputs = self.img_head(img)
+
+        # Normalize float inputs
+        float_outputs = self.float_feature_extractor(
+            (float_inputs - self.float_inputs_mean) / self.float_inputs_std
+        )
+
         return torch.cat((img_outputs, float_outputs), 1)
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        return self
 
 
 class SquashedGaussianMLPActor(nn.Module):
-    def __init__(self,
-                 hidden_sizes,
-                 act_dim,
-                 act_limit,
-                 activation
-                 ):
+    def __init__(self, hidden_sizes, act_dim, act_limit, activation):
         super().__init__()
+
         self.feature_extractor = FeatureExtractor()
         self.net = mlp([self.feature_extractor.output_dim] + list(hidden_sizes), activation)
         self.mu_layer = nn.Linear(hidden_sizes[-1], act_dim)
@@ -125,7 +138,10 @@ class SquashedGaussianMLPActor(nn.Module):
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
-    def forward(self, obs: tuple[torch.Tensor, torch.Tensor], deterministic: bool=False, with_logprob: bool=True):
+        # Register log(2) as a buffer for TorchScript compatibility
+        self.register_buffer('log_2', torch.log(torch.tensor(2.0, dtype=torch.float32)))
+
+    def forward(self, obs: tuple[torch.Tensor, torch.Tensor], deterministic: bool = False, with_logprob: bool = True):
         features = self.feature_extractor(obs)
         net_out = self.net(features)
         mu = self.mu_layer(net_out)
@@ -136,19 +152,14 @@ class SquashedGaussianMLPActor(nn.Module):
         # Pre-squash distribution and sample
         pi_distribution = Normal(mu, std)
         if deterministic:
-            # Only used for evaluating policy at test time.
             pi_action = mu
         else:
             pi_action = pi_distribution.rsample()
 
+
         if with_logprob:
-            # Compute logprob from Gaussian, and then apply correction for Tanh squashing.
-            # NOTE: The correction formula is a little bit magic. To get an understanding
-            # of where it comes from, check out the original SAC paper (arXiv 1801.01290)
-            # and look in appendix C. This is a more numerically-stable equivalent to Eq 21.
-            # Try deriving it yourself as a (very difficult) exercise. :)
             logp_pi = pi_distribution.log_prob(pi_action).sum(dim=-1)
-            logp_pi -= (2*(torch.log(torch.tensor(2)) - pi_action - F.softplus(-2*pi_action))).sum(dim=1)
+            logp_pi -= (2 * (self.log_2 - pi_action - F.softplus(-2 * pi_action))).sum(dim=1)
         else:
             logp_pi = None
 
@@ -157,16 +168,29 @@ class SquashedGaussianMLPActor(nn.Module):
 
         return pi_action, logp_pi
 
+    @torch.jit.export
+    def act(self, obs: tuple[torch.Tensor, torch.Tensor], deterministic: bool = False) -> torch.Tensor:
+        with torch.no_grad():
+            pi_action, _ = self(obs, deterministic, False)
+            return pi_action
+
 
 class MLPQFunction(nn.Module):
 
     def __init__(self, hidden_sizes, activation):
         super().__init__()
         self.feature_extractor = FeatureExtractor()
-        self.q = mlp([self.feature_extractor.output_dim] + list(hidden_sizes) + [1], activation)
+        # TODO: HARDCODED AMOUNT OF ACTIONS
+        self.q = mlp([self.feature_extractor.output_dim + 3] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs: tuple[torch.Tensor, torch.Tensor], act):
+        #print(f"\nQ network forward debug:")
+        #print(f"Input action requires_grad: {act.requires_grad}")
         features = self.feature_extractor(obs)
-        q = self.q(torch.cat([features, act], dim=-1))
+        #print(f"Features requires_grad: {features.requires_grad}")
+        fa = torch.cat([features, act], dim=-1)
+        #print(f"Concatenated tensor requires_grad: {fa.requires_grad}")
+        q = self.q(fa)
+        #print(f"Q output requires_grad: {q.requires_grad}")
         return torch.squeeze(q, -1) # Critical to ensure q has right shape.
 

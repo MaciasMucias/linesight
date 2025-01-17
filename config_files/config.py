@@ -28,8 +28,8 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v10"
-running_speed = 10
+run_name = "sac_run_v12"
+running_speed = 80
 
 tm_engine_step_per_action = 5
 ms_per_tm_engine_step = 10
@@ -80,7 +80,7 @@ prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER pa
 prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
 prio_beta = np.float32(1)
 
-number_times_single_memory_is_used_before_discard = 32  # 32 // 4
+number_times_single_memory_is_used_before_discard = 16  # 32 // 4
 
 memory_size_schedule = [
     (0, (50_000, 20_000)),

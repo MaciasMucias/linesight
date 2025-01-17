@@ -141,8 +141,8 @@ def buffer_collate_function(batch):
         )
     )
 
-    state_img = (state_img.to(torch.float16) - 128) / 128
-    next_state_img = (next_state_img.to(torch.float16) - 128) / 128
+    state_img = (state_img.to(torch.float32) - 128) / 128
+    next_state_img = (next_state_img.to(torch.float32) - 128) / 128
 
     if config_copy.apply_randomcrop_augmentation:
         # Same transformation is applied for state and next_state.

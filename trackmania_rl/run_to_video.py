@@ -7,7 +7,7 @@ This file contains various utilities to:
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -27,7 +27,7 @@ def write_actions_from_disk_in_tmi_format(infile_path: Path, outfile_path: Path)
     write_actions_in_tmi_format(joblib.load(infile_path), outfile_path)
 
 
-def write_actions_in_tmi_format(action_idxs: List[int], outfile_path: Path):
+def write_actions_in_tmi_format(actions: List[np.ndarray], outfile_path: Path):
     """
     Input : list of action indices.
     Output: write a text file on disk containing the corresponding inputs, readable by TMI to load the replay
@@ -35,34 +35,37 @@ def write_actions_in_tmi_format(action_idxs: List[int], outfile_path: Path):
     outfile = open(outfile_path, "w")
     time_from = 0
     time_delta_s = config.tm_engine_step_per_action * 0.01
-    last_press = {"accelerate": -1, "brake": -1, "left": -1, "right": -1}
-    for action_idx in action_idxs[:-1]:
-        action = config.inputs[action_idx]
-        for key, val in action.items():
-            if val:
-                if last_press[key] == -1:
-                    last_press[key] = time_from
-            elif last_press[key] != -1:
-                outfile.write(
-                    str(round(last_press[key], 2))
-                    + "-"
-                    + str(round(time_from, 2))
-                    + " press "
-                    + {"accelerate": "up", "brake": "down", "left": "left", "right": "right"}[key]
-                    + "\n"
-                )
-                last_press[key] = -1
-        time_from += time_delta_s
-    for key, val in last_press.items():
-        if val != -1:
+    last_press = [-1, -1, -1]
+    print(actions)
+    print(actions[0])
+    for action in actions:
+        steer, up, down = action.tolist()
+        steer, up, down = (steer * 65536, up >= 0, down >= 0)
+        step_time = str(round(time_from, 2))
+        if steer != last_press[0]:
             outfile.write(
-                str(round(last_press[key], 2))
-                + "-"
-                + str(round(time_from, 2))
-                + " press "
-                + {"accelerate": "up", "brake": "down", "left": "left", "right": "right"}[key]
-                + "\n"
+                step_time
+                + " steer "
+                +  str(steer)
             )
+            last_press[0] = steer
+
+        if up != last_press[1]:
+            outfile.write(
+                step_time
+                + " press " if up else " rel "
+                + "up"
+            )
+            last_press[1] = up
+
+        if down != last_press[2]:
+            outfile.write(
+                step_time
+                + " press " if down else " rel "
+                + "down"
+            )
+            last_press[2] = down
+        time_from += time_delta_s
     outfile.close()
 
 
