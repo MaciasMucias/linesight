@@ -68,40 +68,8 @@ def collector_process_fn(
 
     def update_network():
         # Update weights of the inference network
-
-
         with shared_network_lock:
-            # Check weights before update
-            # print("Checking weights before update...")
-            different_before, diffs_before = verify_network_update(
-                uncompiled_inference_network,
-                uncompiled_shared_network
-            )
-            # Perform update
             uncompiled_inference_network.load_state_dict(uncompiled_shared_network.state_dict())
-
-            # # Check weights after update
-            # print("Checking weights after update...")
-            # different_after, diffs_after = verify_network_update(
-            #     uncompiled_inference_network,
-            #     uncompiled_shared_network
-            # )
-            #
-            # if different_before:
-            #     print("Networks were different before update")
-            #     print("Differences by layer:")
-            #     for key, diff in diffs_before.items():
-            #         print(f"{key}: {diff:.8f}")
-            # else:
-            #     print("Networks were identical before update")
-            #
-            # if different_after:
-            #     print("WARNING: Networks still different after update!")
-            #     print("Remaining differences:")
-            #     for key, diff in diffs_after.items():
-            #         print(f"{key}: {diff:.8f}")
-            # else:
-            #     print("Networks successfully synchronized")
 
     # ========================================================
     # Training loop

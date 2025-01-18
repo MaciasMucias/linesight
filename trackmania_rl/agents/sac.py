@@ -280,6 +280,7 @@ class Trainer:
             self.pi_scaler,
             self.q_scaler,
             self.alpha_scaler,
+            self.log_alpha
         )
 
     def load_weights_and_stats(self, save_dir):
@@ -287,6 +288,7 @@ class Trainer:
         try:
             self.ac.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
             self.ac_targ.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
+            self.log_alpha = torch.load(f=save_dir / "log_alpha.torch", weights_only=False)
             print(" =====================     Learner weights loaded !     ============================")
         except:
             print(" Learner could not load weights")

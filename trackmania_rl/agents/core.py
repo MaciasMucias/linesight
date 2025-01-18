@@ -184,13 +184,8 @@ class MLPQFunction(nn.Module):
         self.q = mlp([self.feature_extractor.output_dim + 3] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs: tuple[torch.Tensor, torch.Tensor], act):
-        #print(f"\nQ network forward debug:")
-        #print(f"Input action requires_grad: {act.requires_grad}")
         features = self.feature_extractor(obs)
-        #print(f"Features requires_grad: {features.requires_grad}")
         fa = torch.cat([features, act], dim=-1)
-        #print(f"Concatenated tensor requires_grad: {fa.requires_grad}")
         q = self.q(fa)
-        #print(f"Q output requires_grad: {q.requires_grad}")
-        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+        return torch.squeeze(q, -1)
 

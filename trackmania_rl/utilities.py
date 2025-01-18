@@ -187,6 +187,7 @@ def save_checkpoint(
     policy_scaler: torch.cuda.amp.GradScaler,
     q_scaler: torch.cuda.amp.GradScaler,
     alpha_scaler: torch.cuda.amp.GradScaler,
+    log_alpha: torch.cuda.FloatTensor,
 ):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     torch.save(online_network.state_dict(), checkpoint_dir / "weights1.torch")
@@ -197,3 +198,4 @@ def save_checkpoint(
     torch.save(policy_scaler.state_dict(), checkpoint_dir / "policy_scaler.torch")
     torch.save(q_scaler.state_dict(), checkpoint_dir / "q_scaler.torch")
     torch.save(alpha_scaler.state_dict(), checkpoint_dir / "alpha_scaler.torch")
+    torch.save(log_alpha, checkpoint_dir / "log_alpha.torch")

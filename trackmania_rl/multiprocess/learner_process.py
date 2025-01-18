@@ -122,11 +122,6 @@ def learner_process_fn(
     # ========================================================
     # Create new stuff
     # ========================================================
-
-    # target_network, _ = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-
-
-
     accumulated_stats: defaultdict[str, typing.Any] = defaultdict(int)
     accumulated_stats["alltime_min_ms"] = {}
     accumulated_stats["rolling_mean_ms"] = {}
@@ -202,21 +197,8 @@ def learner_process_fn(
     inferer = sac.Inferer(
         inference_network=trainer.ac
     )
-    old_state_dict = deepcopy(trainer.ac_uncompiled.state_dict())
 
     while True:  # Trainer loop
-
-        # new_state_dict = deepcopy(trainer.ac_uncompiled.state_dict())
-        #
-        # different, diffs = verify_network_update(old_state_dict, new_state_dict)
-        # if different:
-        #     print("[LEARNER LOOP] Networks were different before update")
-        #     print("[LEARNER LOOP] Differences by layer:")
-        #     for key, diff in diffs.items():
-        #         print(f"{key}: {diff:.8f}")
-        # else:
-        #     print("[LEARNER LOOP] Networks were the same")
-
         before_wait_time = time.perf_counter()
         wait(rollout_queue_readers)
         time_waited = time.perf_counter() - before_wait_time
@@ -485,28 +467,8 @@ def learner_process_fn(
 
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
-                            print("[LEARNER] Checking weights before update...")
-                            different_before, diffs_before = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
                             uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
-                            # Check weights after update
-                            print("[LEARNER] Checking weights after update...")
-                            different_after, diffs_after = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
 
-                            if different_before:
-                                print("[LEARNER] Networks were different before update")
-                                print("[LEARNER] Differences by layer:")
-                                for key, diff in diffs_before.items():
-                                    print(f"{key}: {diff:.8f}")
-                            else:
-                                print("[LEARNER] Networks were identical before update")
-
-                            if different_after:
-                                print("[LEARNER] WARNING: Networks still different after update!")
-                                print("[LEARNER] Remaining differences:")
-                                for key, diff in diffs_after.items():
-                                    print(f"{key}: {diff:.8f}")
-                            else:
-                                print("[LEARNER] Networks successfully synchronized")
             sys.stdout.flush()
 
         # ===============================================
