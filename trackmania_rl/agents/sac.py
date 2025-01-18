@@ -94,27 +94,6 @@ def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[MLPActorC
         uncompiled_model.to(device="cuda", memory_format=torch.channels_last).train(),
     )
 
-def verify_network_update(inf_state, shared_state):
-    """
-    Returns True if networks have different weights, False if identical
-    """
-    are_different = False
-
-    # Get state dicts
-    inf_state = deepcopy(inf_state)
-    shared_state = deepcopy(shared_state)
-
-    # Compare each parameter
-    differences = {}
-    for key in inf_state:
-        if not torch.equal(inf_state[key], shared_state[key]):
-            are_different = True
-            # Calculate difference magnitude
-            diff = (inf_state[key] - shared_state[key]).abs().mean().item()
-            differences[key] = diff
-
-    return are_different, differences
-
 
 class Trainer:
     def __init__(
@@ -129,6 +108,8 @@ class Trainer:
         self.autolearn_alpha = autolearn_alpha
 
         self.ac, self.ac_uncompiled = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
+        print(f"ac weight location: {self.ac.pi.net[0].weight.data_ptr()}")
+        print(f"ac_uncompiled weight location: {self.ac_uncompiled.pi.net[0].weight.data_ptr()}")
         self.ac_targ = deepcopy(self.ac_uncompiled)
 
         # Disable gradients for target network BEFORE compilation
@@ -205,7 +186,7 @@ class Trainer:
 
     def update(self, data, learn: bool):
         # First run one gradient descent step for Q1 and Q2
-
+        old_weights = self.ac.q1.q[0].weight.clone()
         o, a, r, o2, d, gamma = data
 
         pi, logp_pi = self.ac.pi(o, deterministic=not learn)

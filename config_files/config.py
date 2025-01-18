@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "sac_run_v12"
+run_name = "sac_run_v14"
 running_speed = 80
 
 tm_engine_step_per_action = 5

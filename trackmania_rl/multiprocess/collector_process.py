@@ -161,7 +161,6 @@ def collector_process_fn(
             inference_network.train()
 
         update_network()
-        print("MODE: " + "TRAINING" if is_explo  else ("EVAL" if not inference_network.training else "WEIRD"))
 
         rollout_start_time = time.perf_counter()
         rollout_results, end_race_stats = tmi.rollout(

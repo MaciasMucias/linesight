@@ -266,7 +266,7 @@ class GameInstanceManager:
             len(rollout_results["actions"]) == 0 or np.any(rollout_results["actions"][-1] != action)
         ):  # Small performance trick, don't update input_state if it doesn't need to be updated
             steer, up, down = action.squeeze().tolist()
-            self.iface.set_input_state(steer * 65536, up >= 0, down >= 0)
+            self.iface.set_input_state(round(steer * 65536), up >= 0, down >= 0)
 
     def request_map(self, map_path: str, zone_centers: npt.NDArray):
         self.latest_map_path_requested = map_path

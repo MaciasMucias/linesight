@@ -465,7 +465,6 @@ def learner_process_fn(
                     print(f"BT   {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}")
                 else:
                     train_start_time = time.perf_counter()
-                    # Unpack all losses from the trainer
                     critic_loss, policy_loss, alpha_loss, entropy = trainer.train_on_batch(buffer, do_learn=True)
                     train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
                     time_training_since_last_tensorboard_write += train_on_batch_duration_history[-1]
@@ -486,28 +485,28 @@ def learner_process_fn(
 
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
-                            #print("[LEARNER] Checking weights before update...")
+                            print("[LEARNER] Checking weights before update...")
                             different_before, diffs_before = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
                             uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
                             # Check weights after update
-                            #print("[LEARNER] Checking weights after update...")
+                            print("[LEARNER] Checking weights after update...")
                             different_after, diffs_after = verify_network_update(uncompiled_shared_network.state_dict(), trainer.ac_uncompiled.state_dict())
 
-                            # if different_before:
-                            #     print("[LEARNER] Networks were different before update")
-                            #     print("[LEARNER] Differences by layer:")
-                            #     for key, diff in diffs_before.items():
-                            #         print(f"{key}: {diff:.8f}")
-                            # else:
-                            #     print("[LEARNER] Networks were identical before update")
-                            #
-                            # if different_after:
-                            #     print("[LEARNER] WARNING: Networks still different after update!")
-                            #     print("[LEARNER] Remaining differences:")
-                            #     for key, diff in diffs_after.items():
-                            #         print(f"{key}: {diff:.8f}")
-                            # else:
-                            #     print("[LEARNER] Networks successfully synchronized")
+                            if different_before:
+                                print("[LEARNER] Networks were different before update")
+                                print("[LEARNER] Differences by layer:")
+                                for key, diff in diffs_before.items():
+                                    print(f"{key}: {diff:.8f}")
+                            else:
+                                print("[LEARNER] Networks were identical before update")
+
+                            if different_after:
+                                print("[LEARNER] WARNING: Networks still different after update!")
+                                print("[LEARNER] Remaining differences:")
+                                for key, diff in diffs_after.items():
+                                    print(f"{key}: {diff:.8f}")
+                            else:
+                                print("[LEARNER] Networks successfully synchronized")
             sys.stdout.flush()
 
         # ===============================================

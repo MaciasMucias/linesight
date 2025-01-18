@@ -40,13 +40,14 @@ def write_actions_in_tmi_format(actions: List[np.ndarray], outfile_path: Path):
     print(actions[0])
     for action in actions:
         steer, up, down = action.tolist()
-        steer, up, down = (steer * 65536, up >= 0, down >= 0)
+        steer, up, down = (round(steer * 65536), up >= 0, down >= 0)
         step_time = str(round(time_from, 2))
         if steer != last_press[0]:
             outfile.write(
                 step_time
                 + " steer "
                 +  str(steer)
+                + "\n"
             )
             last_press[0] = steer
 
@@ -54,7 +55,7 @@ def write_actions_in_tmi_format(actions: List[np.ndarray], outfile_path: Path):
             outfile.write(
                 step_time
                 + " press " if up else " rel "
-                + "up"
+                + "up\n"
             )
             last_press[1] = up
 
@@ -62,7 +63,7 @@ def write_actions_in_tmi_format(actions: List[np.ndarray], outfile_path: Path):
             outfile.write(
                 step_time
                 + " press " if down else " rel "
-                + "down"
+                + "down\n"
             )
             last_press[2] = down
         time_from += time_delta_s
