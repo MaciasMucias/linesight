@@ -1,5 +1,4 @@
 import math
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -27,12 +26,6 @@ class Normal:
         self.scale = resized_[1]
         self._batch_shape = list(self.loc.size())
 
-    def _extended_shape(self, sample_shape: list[int]) -> list[int]:
-        return sample_shape + self._batch_shape
-
-    def sample(self) -> torch.Tensor:
-        return torch.normal(self.loc.expand(self._batch_shape), self.scale.expand(self._batch_shape))
-
     def rsample(self) -> torch.Tensor:
         epsilon = torch.randn_like(self.scale)
         return self.loc + self.scale * epsilon
@@ -42,22 +35,12 @@ class Normal:
         log_scale = torch.log(self.scale)
         return -((value - self.loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
 
-
-def combined_shape(length, shape=None):
-    if shape is None:
-        return (length,)
-    return (length, shape) if np.isscalar(shape) else (length, *shape)
-
 def mlp(sizes, activation, output_activation=nn.Identity):
     layers = []
     for j in range(len(sizes)-1):
         act = activation if j < len(sizes)-2 else output_activation
         layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
     return nn.Sequential(*layers)
-
-def count_vars(module):
-    return sum([np.prod(p.shape) for p in module.parameters()])
-
 
 class FeatureExtractor(torch.nn.Module):
     def __init__(self):
