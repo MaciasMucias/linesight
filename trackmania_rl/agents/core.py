@@ -1,21 +1,14 @@
 import math
-from numbers import Number
-
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pyexpat import features
-
-from torch.distributions import constraints, Distribution
-from math import floor
 from config_files import config_copy
-from config_files.config import float_hidden_dim
 
 
 class Normal:
-    """Jit workaroung"""
+    """Jit workaround"""
     @property
     def mean(self):
         return self.loc
@@ -125,7 +118,7 @@ class FeatureExtractor(torch.nn.Module):
         return self
 
 
-class SquashedGaussianMLPActor(nn.Module):
+class Actor(nn.Module):
     def __init__(self, hidden_sizes, act_dim, act_limit, activation):
         super().__init__()
 
@@ -175,7 +168,7 @@ class SquashedGaussianMLPActor(nn.Module):
             return pi_action
 
 
-class MLPQFunction(nn.Module):
+class QFunction(nn.Module):
 
     def __init__(self, hidden_sizes, activation):
         super().__init__()

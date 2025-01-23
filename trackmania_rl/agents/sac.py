@@ -1,6 +1,5 @@
 import copy
 import itertools
-import sys
 from copy import deepcopy
 
 import joblib
@@ -8,31 +7,27 @@ import torch
 import numpy as np
 import numpy.typing as npt
 import torch.nn.functional as F
-from typing import Tuple, Any
-import math
+from typing import Tuple
 
 from numpy import ndarray
-from torch import Tensor, GradScaler, nn, optim
-from torch.backends.cudnn import deterministic
-from torch.optim import Optimizer
+from torch import nn
 
 from trackmania_rl import utilities
 from trackmania_rl.buffer_management import ReplayBuffer
 from config_files import config_copy
-from .core import SquashedGaussianMLPActor, MLPQFunction
+from .core import Actor, QFunction
 
 
-class MLPActorCritic(nn.Module):
+class SoftActorCritic(nn.Module):
 
     def __init__(self, hidden_sizes=(256,128),
                  activation=nn.LeakyReLU):
         super().__init__()
 
-
         # build policy and value functions
-        self.pi = SquashedGaussianMLPActor(hidden_sizes, 3, 1, activation)
-        self.q1 = MLPQFunction(hidden_sizes, activation)
-        self.q2 = MLPQFunction(hidden_sizes, activation)
+        self.pi = Actor(hidden_sizes, 3, 1, activation)
+        self.q1 = QFunction(hidden_sizes, activation)
+        self.q2 = QFunction(hidden_sizes, activation)
 
     @torch.jit.export
     def act(self, obs: Tuple[torch.Tensor, torch.Tensor], deterministic: bool = False) -> torch.Tensor:
@@ -40,6 +35,7 @@ class MLPActorCritic(nn.Module):
         with torch.no_grad():
             a, _ = self.pi(obs, deterministic, False)
             return a
+
 
 
 
@@ -58,7 +54,7 @@ def sac_loss(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pass
 
-def compile_model(uncompiled_model, jit: bool, is_inference: bool) -> MLPActorCritic:
+def compile_model(uncompiled_model, jit: bool, is_inference: bool) -> SoftActorCritic:
     if jit:
         if config_copy.is_linux:
             compile_mode = None if "rocm" in torch.__version__ else (
@@ -71,7 +67,7 @@ def compile_model(uncompiled_model, jit: bool, is_inference: bool) -> MLPActorCr
     return model
 
 
-def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[MLPActorCritic, MLPActorCritic]:
+def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[SoftActorCritic, SoftActorCritic]:
     """
     Constructs two identical copies of the SAC network.
 
@@ -88,7 +84,7 @@ def make_untrained_sac_network(jit: bool, is_inference: bool) -> Tuple[MLPActorC
         - The (potentially compiled) model for actual use
         - An uncompiled copy for weight sharing between processes
     """
-    uncompiled_model = MLPActorCritic()
+    uncompiled_model = SoftActorCritic()
     return (
         compile_model(uncompiled_model, jit, is_inference).to(device="cuda", memory_format=torch.channels_last).train(),
         uncompiled_model.to(device="cuda", memory_format=torch.channels_last).train(),
@@ -108,8 +104,6 @@ class Trainer:
         self.autolearn_alpha = autolearn_alpha
 
         self.ac, self.ac_uncompiled = make_untrained_sac_network(config_copy.use_jit, is_inference=False)
-        print(f"ac weight location: {self.ac.pi.net[0].weight.data_ptr()}")
-        print(f"ac_uncompiled weight location: {self.ac_uncompiled.pi.net[0].weight.data_ptr()}")
         self.ac_targ = deepcopy(self.ac_uncompiled)
 
         # Disable gradients for target network BEFORE compilation
@@ -185,8 +179,6 @@ class Trainer:
         return o, a, r, o2, d, gamma
 
     def update(self, data, learn: bool):
-        # First run one gradient descent step for Q1 and Q2
-        old_weights = self.ac.q1.q[0].weight.clone()
         o, a, r, o2, d, gamma = data
 
         pi, logp_pi = self.ac.pi(o, deterministic=not learn)
@@ -315,7 +307,7 @@ class Inferer:
     """Handles inference for SAC policy network"""
     __slots__ = ("ac", "is_explo")
 
-    def __init__(self, inference_network: MLPActorCritic):
+    def __init__(self, inference_network: SoftActorCritic):
         self.ac = inference_network
         self.is_explo = None
 
@@ -332,8 +324,8 @@ class Inferer:
 
         o = (state_img_tensor, state_float_tensor)
 
-        policy_action, _ = self.ac.pi(o, deterministic=not self.is_explo, with_logprob=False)
         with torch.no_grad():
+            policy_action, _ = self.ac.pi(o, deterministic=not self.is_explo, with_logprob=False)
             q1 = self.ac.q1(o, policy_action)
             q2 = self.ac.q2(o, policy_action)
 
