@@ -218,8 +218,6 @@ class Trainer:
         loss_q1 = F.smooth_l1_loss(q1, backup)
         loss_q2 = F.smooth_l1_loss(q2, backup)
         loss_q = (loss_q1 + loss_q2) / 2
-        print(f"q1={q1[0]}, q2={q2[0]}, backup={backup[0]}")
-
 
         if learn:
             self.q_optimizer.zero_grad()
@@ -284,11 +282,10 @@ class Trainer:
         )
 
     def load_weights_and_stats(self, save_dir):
-        # TODO: THIS DOESNT WORK
         try:
             self.ac.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
             self.ac_targ.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
-            self.log_alpha = torch.load(f=save_dir / "log_alpha.torch", weights_only=False)
+            self.log_alpha.data.copy_(torch.load(f=save_dir / "log_alpha.torch", weights_only=False))
             print(" =====================     Learner weights loaded !     ============================")
         except:
             print(" Learner could not load weights")

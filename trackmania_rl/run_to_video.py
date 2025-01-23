@@ -32,40 +32,28 @@ def write_actions_in_tmi_format(actions: List[np.ndarray], outfile_path: Path):
     Input : list of action indices.
     Output: write a text file on disk containing the corresponding inputs, readable by TMI to load the replay
     """
-    outfile = open(outfile_path, "w")
+    outfile = open(outfile_path , "w")
+
     time_from = 0
     time_delta_s = config.tm_engine_step_per_action * 0.01
     last_press = [-1, -1, -1]
-    print(actions)
-    print(actions[0])
-    for action in actions:
-        steer, up, down = action.tolist()
+    for action in actions[:-1]:
+        steer, up, down = action
         steer, up, down = (round(steer * 65536), up >= 0, down >= 0)
         step_time = str(round(time_from, 2))
+        new_inputs = ""
         if steer != last_press[0]:
-            outfile.write(
-                step_time
-                + " steer "
-                +  str(steer)
-                + "\n"
-            )
+            new_inputs += step_time + " steer " +  str(steer) + "\n"
             last_press[0] = steer
 
         if up != last_press[1]:
-            outfile.write(
-                step_time
-                + " press " if up else " rel "
-                + "up\n"
-            )
+            new_inputs += step_time + (" press " if up else " rel ") + "up\n"
             last_press[1] = up
 
         if down != last_press[2]:
-            outfile.write(
-                step_time
-                + " press " if down else " rel "
-                + "down\n"
-            )
+            new_inputs += step_time + (" press " if down else " rel ") + "down\n"
             last_press[2] = down
+        outfile.write(new_inputs)
         time_from += time_delta_s
     outfile.close()
 
