@@ -35,7 +35,6 @@ def fill_buffer_from_rollout_with_n_steps_rule(
     buffer: ReplayBuffer,
     buffer_test: ReplayBuffer,
     rollout_results: dict,
-    end_race_stats: dict,
     n_steps_max: int,
     gamma: float
 ):

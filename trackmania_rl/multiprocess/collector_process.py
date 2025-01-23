@@ -45,27 +45,6 @@ def collector_process_fn(
 
     inferer = sac.Inferer(inference_network)
 
-    def verify_network_update(inference_net, shared_net):
-        """
-        Returns True if networks have different weights, False if identical
-        """
-        are_different = False
-
-        # Get state dicts
-        inf_state = inference_net.state_dict()
-        shared_state = shared_net.state_dict()
-
-        # Compare each parameter
-        differences = {}
-        for key in inf_state:
-            if not torch.equal(inf_state[key], shared_state[key]):
-                are_different = True
-                # Calculate difference magnitude
-                diff = (inf_state[key] - shared_state[key]).abs().mean().item()
-                differences[key] = diff
-
-        return are_different, differences
-
     def update_network():
         # Update weights of the inference network
         with shared_network_lock:

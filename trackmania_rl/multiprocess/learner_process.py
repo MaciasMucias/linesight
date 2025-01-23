@@ -9,7 +9,6 @@ import sys
 import time
 import typing
 from collections import defaultdict
-from copy import deepcopy
 from datetime import datetime
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -17,7 +16,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
-from art import tprint
 from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
@@ -35,23 +33,6 @@ from trackmania_rl.analysis_metrics import (
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
 
-
-def verify_network_update(inf_state, shared_state):
-    """
-    Returns True if networks have different weights, False if identical
-    """
-    are_different = False
-
-    # Compare each parameter
-    differences = {}
-    for key in inf_state:
-        if not torch.equal(inf_state[key], shared_state[key]):
-            are_different = True
-            # Calculate difference magnitude
-            diff = (inf_state[key] - shared_state[key]).abs().mean().item()
-            differences[key] = diff
-
-    return are_different, differences
 
 def learner_process_fn(
     rollout_queues,
@@ -192,7 +173,6 @@ def learner_process_fn(
     # ========================================================
     # Make the trainer
     # ========================================================
-
 
     inferer = sac.Inferer(
         inference_network=trainer.ac
@@ -408,9 +388,8 @@ def learner_process_fn(
                 buffer,
                 buffer_test,
                 rollout_results,
-                end_race_stats,
                 config_copy.n_steps,
-                gamma
+                gamma,
             )
 
             accumulated_stats["cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
@@ -455,7 +434,6 @@ def learner_process_fn(
                         if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
                         else config_copy.batch_size
                     )
-
                     # Store all metrics in history
                     critic_loss_history.append(critic_loss)
                     policy_loss_history.append(policy_loss)
@@ -472,9 +450,9 @@ def learner_process_fn(
             sys.stdout.flush()
 
         # ===============================================
-        #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES # 1 minute
+        #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES
         # ===============================================
-        save_frequency_s = 2 * 60 # 5 * 60
+        save_frequency_s = 5 * 60
         if time.perf_counter() - time_last_save >= save_frequency_s:
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
