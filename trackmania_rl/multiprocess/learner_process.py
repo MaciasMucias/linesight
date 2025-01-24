@@ -443,6 +443,8 @@ def learner_process_fn(
                     accumulated_stats["cumul_number_batches_done"] += 1
                     print(f"B    {critic_loss=:<8.2e}, {policy_loss=:<8.2e}, {alpha_loss=:<8.2e}, {entropy=:<8.2e}, {train_on_batch_duration_history[-1] * 1000:<8.1f}")
 
+
+                    # Update the collector agents via proxy
                     if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
                         with shared_network_lock:
                             uncompiled_shared_network.load_state_dict(trainer.ac_uncompiled.state_dict())
